@@ -123,12 +123,26 @@ def ensure_default_admin(email: str, password: str = "Admin@1234", reset_passwor
     u.update(updates)
     return _public(u)
 
-# ---------------- imports (teachers/students) ----------------
+# ---------------- temp password generator ----------------
 def _gen_temp_pw(n: int = 12) -> str:
-    letters = string.ascii_letters + string.digits
-    core = "".join(secrets.choice(letters) for _ in range(max(2, n - 2)))
-    return "".join(secrets.choice(core + secrets.choice("!@#$%^&*") + secrets.choice(string.digits)) for _ in range(n))
+    """Guaranteed complexity: lower, upper, digit, symbol + random rest."""
+    n = max(8, n)
+    pools = [
+        secrets.choice(string.ascii_lowercase),
+        secrets.choice(string.ascii_uppercase),
+        secrets.choice(string.digits),
+        secrets.choice("!@#$%^&*"),
+    ]
+    rest_len = n - len(pools)
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    pools += [secrets.choice(alphabet) for _ in range(rest_len)]
+    # Fisher–Yates shuffle
+    for i in range(len(pools)-1, 0, -1):
+        j = secrets.randbelow(i+1)
+        pools[i], pools[j] = pools[j], pools[i]
+    return "".join(pools)
 
+# ---------------- imports (teachers/students) ----------------
 def import_from_collection(source: str, role: str, email_field: str, name_field: str,
                            must_change_password: bool = True) -> Tuple[List[Dict[str, str]], int, int]:
     created, scanned, inserted = [], 0, 0
@@ -164,3 +178,21 @@ def complete_password_reset(email: str, token: str, new_password: str) -> bool:
     if not u or token != u.get("reset_token"):
         return False
     return set_password(email, new_password, clear_reset=True)
+
+# ---------------- admin: issue a fresh temp (show once) ----------------
+def issue_temp_password(email: str, n: int = 12) -> Optional[Dict[str, str]]:
+    """Generate a new temp password for an existing account and force change on next login."""
+    u = get_user(email)
+    if not u:
+        return None
+    temp = _gen_temp_pw(n)
+    _users().update_one(
+        {"_id": u["_id"]},
+        {"$set": {
+            "password_hash": _hash(temp),
+            "must_change_password": True,
+            "password_changed_at": _now(),
+            "updated_at": _now()
+        }}
+    )
+    return {"email": u["email"], "name": u.get("name", u["email"]), "role": u.get("role", ""), "temp_password": temp}
