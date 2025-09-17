@@ -1,36 +1,22 @@
+# pages/2_Faculty.py
 import io
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 from db import col
 
-
-
-from utils import auth  # only for types; not needed if you already have guard_role in app
-# from app import guard_role  # if guard_role is in app.py; or just paste it in a small common module
-
 def guard_role(*roles):
     u = st.session_state.get("user")
     if not u:
-        st.error("Please log in from the home page.")
-        st.stop()
+        st.error("Please log in from the home page."); st.stop()
     if roles and u.get("role") not in roles:
-        st.warning(f"Access restricted to: {', '.join(roles)}")
-        st.stop()
+        st.warning(f"Access restricted to: {', '.join(roles)}"); st.stop()
     return u
 
-user = guard_role("admin", "registrar")  # or "teacher", or "student"
-
-st.set_page_config(page_title="Faculty Dashboard", page_icon="🧑‍🏫", layout="wide")
-
-user = st.session_state.get("user")
-if not user:
-    st.error("Please login from the main page."); st.stop()
-if user["role"] not in ("admin", "teacher", "registrar"):
-    st.warning("You need teacher/registrar/admin role to view this page."); st.stop()
+user = guard_role("admin", "teacher", "registrar")
 
 st.title("🧑‍🏫 Faculty Dashboard")
-st.caption("7 reports. Teacher scope applies automatically.")
+st.caption("Teacher scope applies automatically. Registrars/Admins can filter by teacher.")
 
 def df_download_button(df, filename, label="Download CSV"):
     st.download_button(label, df.to_csv(index=False).encode("utf-8"), filename, "text/csv")
@@ -44,11 +30,45 @@ def has_collection(name):
     except Exception: return False
 
 USE_INGESTED = has_collection("grades_ingested") and col("grades_ingested").estimated_document_count() > 0
-teacher_email = user.get("email") if user["role"] == "teacher" else None
+
+# ── Scope
+teacher_email = None
+if user["role"] == "teacher":
+    teacher_email = user.get("email")
+
+elif user["role"] in ("registrar", "admin"):
+    # Build a list of teachers from enrollments (preferred)
+    emails = []
+    try:
+        emails = sorted({r.get("teacher", {}).get("email","")
+                         for r in col("enrollments").find({}, {"teacher.email":1}).limit(300000)
+                         if r.get("teacher",{}).get("email")})
+    except Exception:
+        pass
+    # fallback to users with role=teacher if enrollments lookup fails
+    if not emails:
+        try:
+            emails = sorted({u.get("email","")
+                             for u in col("users").find({"role":"teacher"}, {"email":1}).limit(5000)
+                             if u.get("email")})
+        except Exception:
+            pass
+
+    choice = st.selectbox("Filter by teacher (Registrar/Admin)", ["(All teachers)"] + emails, index=0)
+    teacher_email = None if choice == "(All teachers)" else choice
+
+# Build query with scope
+def scoped_query(extra=None):
+    extra = extra or {}
+    if user["role"] == "teacher":
+        return {"$and": [{"teacher.email": teacher_email}, extra] if extra else [{"teacher.email": teacher_email}]}
+    if user["role"] in ("registrar", "admin") and teacher_email:
+        return {"$and": [{"teacher.email": teacher_email}, extra] if extra else [{"teacher.email": teacher_email}]}
+    return extra or {}
 
 # 1) Class Grade Distribution (Histogram)
 st.subheader("1) Class Grade Distribution (Histogram)")
-q = {} if user["role"] in ("admin","registrar") else {"teacher.email": teacher_email}
+q = scoped_query()
 if USE_INGESTED:
     rows = list(col("grades_ingested").find(q, {"Grade":1}).limit(300000))
     df1 = pd.DataFrame([r for r in rows if r.get("Grade") is not None])
@@ -103,13 +123,13 @@ else:
 # 4) Intervention Candidates (grade <75 or INC)
 st.subheader("4) Intervention Candidates")
 if USE_INGESTED:
-    q2 = {"$and":[q, {"$or":[{"Grade":{"$lt":75}}, {"Remark":"INC"}]}]}
+    q2 = scoped_query({"$or":[{"Grade":{"$lt":75}}, {"Remark":"INC"}]})
     rows = list(col("grades_ingested").find(q2, {"StudentID":1,"SubjectCode":1,"Grade":1,"Remark":1,"term":1}).limit(20000))
     df4 = pd.DataFrame([{"student_id": r.get("StudentID",""), "subject": r.get("SubjectCode",""),
                          "term": f"{r.get('term',{}).get('school_year','')} S{r.get('term',{}).get('semester','')}",
                          "grade": r.get("Grade"), "remark": r.get("Remark")} for r in rows])
 else:
-    q2 = {"$and":[q, {"$or":[{"grade":{"$lt":75}}, {"remark":"INC"}]}]}
+    q2 = scoped_query({"$or":[{"grade":{"$lt":75}}, {"remark":"INC"}]})
     rows = list(col("enrollments").find(q2, {"student":1,"subject":1,"grade":1,"remark":1,"term":1}).limit(20000))
     df4 = pd.DataFrame([{"student": r.get("student",{}).get("student_no",""), "subject": r.get("subject",{}).get("code",""),
                          "term": f"{r.get('term',{}).get('school_year','')} S{r.get('term',{}).get('semester','')}",
@@ -141,12 +161,11 @@ with st.form("custom_query"):
     submit = st.form_submit_button("Run")
 if submit:
     src = "grades_ingested" if USE_INGESTED else "enrollments"
-    qf = {}
+    qf = scoped_query({})
     if subj.strip():
         qf["SubjectCode" if USE_INGESTED else "subject.code"] = subj.strip()
-    qf["Grade" if USE_INGESTED else "grade"] = {"$gte": int(min_g), "$lte": int(max_g)}
-    if user["role"] == "teacher":
-        qf["teacher.email"] = teacher_email
+    key_grade = "Grade" if USE_INGESTED else "grade"
+    qf[key_grade] = {"$gte": int(min_g), "$lte": int(max_g)}
     res = list(col(src).find(qf).limit(2000))
     dfr = pd.DataFrame(res); st.dataframe(dfr, use_container_width=True); df_download_button(dfr, "faculty_custom_query.csv")
     st.text_area("Insight", value="Ad-hoc filtered results.", key="fac6")

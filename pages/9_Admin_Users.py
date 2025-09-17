@@ -6,23 +6,20 @@ from utils.mongo_df import docs_to_df
 
 st.set_page_config(page_title="Admin: Users", page_icon="🛠️", layout="wide")
 
-# --------- access control ---------
 u = st.session_state.get("user")
 if not u or u.get("role") != "admin":
     st.error("Admins only.")
     st.stop()
 
-# --------- session store for created/issued temps (persists across reruns) ---------
 if "last_created_accounts" not in st.session_state:
     st.session_state["last_created_accounts"] = []
 
 st.title("🛠️ Admin: Users")
 tabs = st.tabs(["Create User", "Import from Teachers", "Import from Students", "All Users"])
 
-# =========== Tab 0: Create User ===========
+# Create User
 with tabs[0]:
     st.subheader("Create User")
-
     col1, col2, col3 = st.columns([2,2,1])
     with col1:
         email = st.text_input("Email")
@@ -37,7 +34,7 @@ with tabs[0]:
         if not email:
             st.error("Email is required.")
         else:
-            temp_pw = pw or auth._gen_temp_pw()  # generate once on UI side
+            temp_pw = pw or auth._gen_temp_pw()
             auth.create_user(email, name, role, temp_pw, must_change_password=mustc)
             st.session_state["last_created_accounts"] = [{
                 "email": email, "name": name or email, "role": role, "temp_password": temp_pw
@@ -48,21 +45,14 @@ with tabs[0]:
         df = pd.DataFrame(st.session_state["last_created_accounts"])
         st.warning("Copy or download these temporary passwords now—they are NOT stored in plaintext.")
         st.dataframe(df, use_container_width=True)
-        st.download_button(
-            "Download CSV",
-            df.to_csv(index=False).encode("utf-8"),
-            "new_accounts.csv",
-            "text/csv",
-            key="dl_single",
-        )
+        st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
+                           "new_accounts.csv", "text/csv", key="dl_single")
 
-# =========== Tab 1: Import from Teachers ===========
+# Import from Teachers
 with tabs[1]:
     st.subheader("Import from Teachers")
     if st.button("Create teacher accounts not in Users", help="Scans the 'teachers' collection"):
-        created, scanned, inserted = auth.import_from_collection(
-            "teachers", role="teacher", email_field="email", name_field="name"
-        )
+        created, scanned, inserted = auth.import_from_collection("teachers", role="teacher", email_field="email", name_field="name")
         st.success(f"Scanned {scanned}. Created {inserted}.")
         st.session_state["last_created_accounts"] = created
 
@@ -70,21 +60,14 @@ with tabs[1]:
         df = pd.DataFrame(st.session_state["last_created_accounts"])
         st.warning("Copy or download these temporary passwords now—they are NOT stored in plaintext.")
         st.dataframe(df, use_container_width=True)
-        st.download_button(
-            "Download CSV",
-            df.to_csv(index=False).encode("utf-8"),
-            "new_teacher_accounts.csv",
-            "text/csv",
-            key="dl_teachers",
-        )
+        st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
+                           "new_teacher_accounts.csv", "text/csv", key="dl_teachers")
 
-# =========== Tab 2: Import from Students ===========
+# Import from Students
 with tabs[2]:
     st.subheader("Import from Students")
     if st.button("Create student accounts not in Users", help="Scans the 'students' collection"):
-        created, scanned, inserted = auth.import_from_collection(
-            "students", role="student", email_field="Email", name_field="Name"
-        )
+        created, scanned, inserted = auth.import_from_collection("students", role="student", email_field="Email", name_field="Name")
         st.success(f"Scanned {scanned}. Created {inserted}.")
         st.session_state["last_created_accounts"] = created
 
@@ -92,15 +75,10 @@ with tabs[2]:
         df = pd.DataFrame(st.session_state["last_created_accounts"])
         st.warning("Copy or download these temporary passwords now—they are NOT stored in plaintext.")
         st.dataframe(df, use_container_width=True)
-        st.download_button(
-            "Download CSV",
-            df.to_csv(index=False).encode("utf-8"),
-            "new_student_accounts.csv",
-            "text/csv",
-            key="dl_students",
-        )
+        st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
+                           "new_student_accounts.csv", "text/csv", key="dl_students")
 
-# =========== Tab 3: All Users (with reset tool) ===========
+# All Users + Reset
 with tabs[3]:
     st.subheader("All Users")
     docs = auth.list_users()
@@ -128,10 +106,5 @@ with tabs[3]:
         df = pd.DataFrame(st.session_state["last_created_accounts"])
         st.warning("Copy or download these temporary passwords now—they are NOT stored in plaintext.")
         st.dataframe(df, use_container_width=True)
-        st.download_button(
-            "Download CSV",
-            df.to_csv(index=False).encode("utf-8"),
-            "issued_temp_passwords.csv",
-            "text/csv",
-            key="dl_reset",
-        )
+        st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
+                           "issued_temp_passwords.csv", "text/csv", key="dl_reset")
