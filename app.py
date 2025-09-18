@@ -1,113 +1,168 @@
 # app.py
+# ─────────────────────────────────────────────────────────────────────────────
+# MIT261 Student Analytics — Entry / Login
+# - Single place that sets page config
+# - Seeds demo accounts on demand
+# - Verifies bcrypt password
+# - Redirects to role page with st.switch_page()
+# ─────────────────────────────────────────────────────────────────────────────
+
 import streamlit as st
-from utils import auth
+from datetime import datetime
+import bcrypt
+from pymongo.errors import PyMongoError
 
-st.set_page_config(page_title="MIT261 Student Analytics", page_icon="🎓", layout="wide")
+# Our tiny DB helper (already in your repo)
+from db import col
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Header & helpers
-# ───────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="MIT261 Student Analytics",
+    page_icon="🎓",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-def header():
-    st.markdown("## 🎓 MIT261 Student Analytics")
-    u = st.session_state.get("user")
-    if u:
-        st.caption(f"Logged in as **{u['email']}** · role: **{u['role']}**")
-        if st.button("Log out", type="secondary"):
-            st.session_state.pop("user", None)
-            st.session_state.pop("pending_user", None)
-            st.rerun()
+# Hide default Streamlit chrome a bit
+st.markdown(
+    """
+    <style>
+      #MainMenu, header, footer {visibility: hidden;}
+      .small-note {opacity: .7; font-size: 0.9rem;}
+      .tight {padding-top: .35rem; padding-bottom: .35rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-def show_change_password():
-    u = st.session_state.get("pending_user")
-    st.info("You must set a new password to continue.")
-    p1 = st.text_input("New password", type="password")
-    p2 = st.text_input("Confirm new password", type="password")
-    if st.button("Update password"):
-        if not p1 or p1 != p2:
-            st.error("Passwords do not match.")
-            return
-        if auth.set_password(u["email"], p1):
-            st.session_state["user"] = auth._public(auth.get_user(u["email"]))
-            st.session_state.pop("pending_user", None)
-            st.success("Password updated.")
-            st.rerun()
-        else:
-            st.error("Failed to update password.")
 
-def show_login():
-    st.subheader("Sign in")
-    email = st.text_input("Email")
-    pw    = st.text_input("Password", type="password")
-    c1, c2 = st.columns([1,1])
+# ───────────────────────────── Helpers ──────────────────────────────────────
+def _b(x):  # bytes helper
+    return x if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8")
 
-    if c1.button("Login", use_container_width=True):
-        u = auth.verify_login(email, pw)
-        if not u:
-            st.error("Invalid email/password or inactive account.")
-        elif u.get("must_change_password"):
-            st.session_state["pending_user"] = auth._public(u)
-            st.rerun()
-        else:
-            st.session_state["user"] = auth._public(u)
-            st.success("Welcome!")
-            st.rerun()
 
-    if c2.button("Create default admin", use_container_width=True):
-        a = auth.ensure_default_admin("admin@su.edu", "Admin@1234", reset_password=True)
-        st.success(
-            f"Admin ensured: {a['email']} / temp password **Admin@1234** "
-            "(must change on first login)."
-        )
+def hash_pw(plain: str) -> str:
+    return bcrypt.hashpw(_b(plain), bcrypt.gensalt()).decode("utf-8")
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Entry
-# ───────────────────────────────────────────────────────────────────────────────
-header()
 
-# Pending password change?
-if "pending_user" in st.session_state and not st.session_state.get("user"):
-    show_change_password()
-    st.stop()
+def verify_pw(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(_b(plain), _b(hashed))
+    except Exception:
+        return False
 
-# Not logged in yet → show login
-if not st.session_state.get("user"):
-    show_login()
-    st.stop()
 
-# Logged in
-u = st.session_state["user"]
+def get_user_by_email(email: str):
+    if not email:
+        return None
+    return col("users").find_one({"email": email.strip().lower()})
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Role-based navigation (Streamlit 1.37+)
-# Only show the pages allowed for this role.
-# Keep page-level guards in each page as a second layer of protection.
-# ───────────────────────────────────────────────────────────────────────────────
-pages = []
 
-# Registrar & Admin → Registrar dashboard
-if u["role"] in ("registrar", "admin"):
-    pages.append(st.Page("pages/1_Registrar.py", title="Registrar", icon="📊"))
+def upsert_user(email: str, name: str, role: str, password_plain: str):
+    now = datetime.utcnow()
+    email_n = email.strip().lower()
+    doc = {
+        "email": email_n,
+        "name": name,
+        "role": role,
+        "password": hash_pw(password_plain),
+        "active": True,
+        "updated_at": now,
+    }
+    col("users").update_one(
+        {"email": email_n},
+        {"$set": doc, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
 
-# Teacher, Registrar & Admin → Faculty dashboard
-if u["role"] in ("teacher", "registrar", "admin"):
-    pages.append(st.Page("pages/2_Faculty.py", title="Faculty", icon="🧑‍🏫"))
 
-# Everyone → Student dashboard
-pages.append(st.Page("pages/3_Student.py", title="Student", icon="🎒"))
+def create_sample_accounts():
+    # Registrar / Faculty / Student / Admin
+    upsert_user("registrar@su.edu", "Registrar", "registrar", "reg123")
+    upsert_user("0005@su.edu", "Riley Santiago", "faculty", "teach123")
+    upsert_user("s00001@students.su.edu", "Morgan Querubin", "student", "stud123")
+    upsert_user("admin@su.edu", "Site Admin", "admin", "admin123")
 
-# Admin tools
-if u["role"] == "admin":
-    pages.append(st.Page("pages/9_Admin_Users.py", title="Admin Users", icon="🛠️"))
 
-nav = st.navigation({"app": pages})
+def reset_demo_accounts():
+    col("users").delete_many(
+        {"email": {"$in": ["registrar@su.edu", "0005@su.edu", "s00001@students.su.edu", "admin@su.edu"]}}
+    )
+    create_sample_accounts()
 
-# Optional: if the user is a student, direct them to Student page on first load
-try:
-    if u["role"] == "student":
+
+def go_to_role_home(role: str):
+    role = (role or "").lower()
+    # These are your existing pages
+    if role == "registrar":
+        st.switch_page("pages/1_Registrar.py")
+    elif role == "faculty":
+        st.switch_page("pages/2_Faculty.py")
+    elif role == "student":
         st.switch_page("pages/3_Student.py")
-except Exception:
-    pass
+    elif role == "admin":
+        st.switch_page("pages/9_Admin_Users.py")
+    else:
+        st.warning("Unknown role; ask an admin to update your account.")
 
-# Render the selected page
-nav.run()
+
+# ───────────────────────────── UI ───────────────────────────────────────────
+def login_view():
+    st.markdown("### 🎓 MIT261 Student Analytics")
+    st.markdown("<div class='small-note'>Sign in</div>", unsafe_allow_html=True)
+
+    with st.container():
+        email = st.text_input("Email", key="login_email", value="", placeholder="you@su.edu")
+        pw_col1, pw_col2 = st.columns([1, 14])
+        with pw_col1:
+            st.write("")  # spacer
+        password = st.text_input("Password", type="password", key="login_pw")
+
+        b1, b2 = st.columns([1, 1])
+        with b1:
+            do_login = st.button("Login", use_container_width=True)
+        with b2:
+            do_seed = st.button("Create sample accounts", use_container_width=True)
+
+        # Optional tiny reset button
+        if st.button("Reset demo accounts", type="secondary"):
+            reset_demo_accounts()
+            st.success("Demo accounts reset. Try registrar@su.edu / reg123")
+            st.stop()
+
+    if do_seed:
+        try:
+            create_sample_accounts()
+            st.success("Sample accounts created. Try registrar@su.edu / reg123")
+        except PyMongoError as e:
+            st.error(f"Failed creating users: {e}")
+        st.stop()
+
+    if do_login:
+        user = get_user_by_email(email)
+        if not user or not user.get("password") or not verify_pw(password, user["password"]):
+            st.error("Invalid credentials.")
+            st.stop()
+
+        if not user.get("active", True):
+            st.error("Account is disabled. Contact an admin.")
+            st.stop()
+
+        # Save to session and route
+        st.session_state.user = {
+            "email": user["email"],
+            "name": user.get("name", ""),
+            "role": user.get("role", ""),
+        }
+        go_to_role_home(user.get("role", ""))
+
+
+def auto_route_if_logged_in():
+    u = st.session_state.get("user")
+    if u and u.get("role"):
+        go_to_role_home(u["role"])
+
+
+# ───────────────────────────── Entry ────────────────────────────────────────
+if __name__ == "__main__":
+    auto_route_if_logged_in()
+    login_view()
