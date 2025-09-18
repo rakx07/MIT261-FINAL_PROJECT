@@ -1,6 +1,6 @@
 # utils/auth.py
 from __future__ import annotations
-import secrets, string, re
+import secrets, string
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone
 
@@ -35,7 +35,8 @@ def _check_pw(pw: str, stored) -> bool:
     return False
 
 def _public(u: dict) -> dict:
-    if not u: return {}
+    if not u: 
+        return {}
     out = dict(u)
     out.pop("password_hash", None)
     out.pop("reset_token", None)
@@ -167,7 +168,8 @@ def import_from_collection(source: str, role: str, email_field: str, name_field:
 # ---------------- optional reset tokens ----------------
 def start_password_reset(email: str) -> Optional[str]:
     u = get_user(email)
-    if not u: return None
+    if not u: 
+        return None
     token = secrets.token_urlsafe(24)
     _users().update_one({"_id": u["_id"]},
                         {"$set": {"reset_token": token, "updated_at": _now(), "must_change_password": True}})
@@ -179,20 +181,32 @@ def complete_password_reset(email: str, token: str, new_password: str) -> bool:
         return False
     return set_password(email, new_password, clear_reset=True)
 
-# ---------------- admin: issue a fresh temp (show once) ----------------
-def issue_temp_password(email: str, n: int = 12) -> Optional[Dict[str, str]]:
-    """Generate a new temp password for an existing account and force change on next login."""
-    u = get_user(email)
+# ---------------- Streamlit session helpers ----------------
+import streamlit as st
+
+def current_user() -> dict:
+    """Return the currently logged-in user dict stored in session_state, or {}."""
+    return st.session_state.get("user") or {}
+
+def set_current_user(user: Optional[dict]) -> None:
+    """Set/clear the logged-in user in session_state."""
+    st.session_state["user"] = user or {}
+
+def require_role(*roles: str) -> dict:
+    """
+    Stop the app unless the logged-in user has one of the allowed roles.
+    Returns the user dict if authorized.
+    """
+    u = current_user()
     if not u:
-        return None
-    temp = _gen_temp_pw(n)
-    _users().update_one(
-        {"_id": u["_id"]},
-        {"$set": {
-            "password_hash": _hash(temp),
-            "must_change_password": True,
-            "password_changed_at": _now(),
-            "updated_at": _now()
-        }}
-    )
-    return {"email": u["email"], "name": u.get("name", u["email"]), "role": u.get("role", ""), "temp_password": temp}
+        st.error("You must sign in to view this page.")
+        st.stop()
+    if roles and u.get("role") not in roles:
+        st.error("You are not authorized to view this page.")
+        st.stop()
+    return u
+
+# --------- compatibility alias (prevents ImportError) ----------
+def get_current_user() -> dict:
+    """Backward-compatible alias for legacy imports."""
+    return current_user()

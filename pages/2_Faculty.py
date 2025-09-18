@@ -1,186 +1,360 @@
 # pages/2_Faculty.py
-import io
-import streamlit as st
+from __future__ import annotations
+import math
+from typing import List, Optional, Tuple, Set
+
 import pandas as pd
-import matplotlib.pyplot as plt
+import streamlit as st
+
 from db import col
+from utils.auth import current_user
 
-def guard_role(*roles):
-    u = st.session_state.get("user")
-    if not u:
-        st.error("Please log in from the home page."); st.stop()
-    if roles and u.get("role") not in roles:
-        st.warning(f"Access restricted to: {', '.join(roles)}"); st.stop()
-    return u
 
-user = guard_role("admin", "teacher", "registrar")
+# ──────────────────────────────────────────────────────────────────────────────
+# Small helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
-st.title("🧑‍🏫 Faculty Dashboard")
-st.caption("Teacher scope applies automatically. Registrars/Admins can filter by teacher.")
-
-def df_download_button(df, filename, label="Download CSV"):
-    st.download_button(label, df.to_csv(index=False).encode("utf-8"), filename, "text/csv")
-
-def fig_download_button(fig, filename, label="Download PNG"):
-    buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-    st.download_button(label, buf.getvalue(), filename, "image/png")
-
-def has_collection(name): 
-    try: return name in col(name).database.list_collection_names()
-    except Exception: return False
-
-USE_INGESTED = has_collection("grades_ingested") and col("grades_ingested").estimated_document_count() > 0
-
-# ── Scope
-teacher_email = None
-if user["role"] == "teacher":
-    teacher_email = user.get("email")
-
-elif user["role"] in ("registrar", "admin"):
-    # Build a list of teachers from enrollments (preferred)
-    emails = []
+def _term_label(sy: str | None, sem: int | None) -> str:
+    if not sy:
+        return "—"
     try:
-        emails = sorted({r.get("teacher", {}).get("email","")
-                         for r in col("enrollments").find({}, {"teacher.email":1}).limit(300000)
-                         if r.get("teacher",{}).get("email")})
+        s = int(sem or 0)
     except Exception:
-        pass
-    # fallback to users with role=teacher if enrollments lookup fails
-    if not emails:
-        try:
-            emails = sorted({u.get("email","")
-                             for u in col("users").find({"role":"teacher"}, {"email":1}).limit(5000)
-                             if u.get("email")})
-        except Exception:
-            pass
+        s = 0
+    return f"{sy} S{s}" if s else sy
 
-    choice = st.selectbox("Filter by teacher (Registrar/Admin)", ["(All teachers)"] + emails, index=0)
-    teacher_email = None if choice == "(All teachers)" else choice
 
-# Build query with scope
-def scoped_query(extra=None):
-    extra = extra or {}
-    if user["role"] == "teacher":
-        return {"$and": [{"teacher.email": teacher_email}, extra] if extra else [{"teacher.email": teacher_email}]}
-    if user["role"] in ("registrar", "admin") and teacher_email:
-        return {"$and": [{"teacher.email": teacher_email}, extra] if extra else [{"teacher.email": teacher_email}]}
-    return extra or {}
+def _term_sort_key(label: str) -> tuple[int, int]:
+    """Sort "2023-2024 S1", "2023-2024 S2", "2024-2025 S1" properly."""
+    if not isinstance(label, str) or " S" not in label:
+        return (0, 0)
+    sy, s = label.split(" S", 1)
+    try:
+        start_year = int(sy.split("-")[0])
+    except Exception:
+        start_year = 0
+    try:
+        sem = int(s)
+    except Exception:
+        sem = 0
+    return (start_year, sem)
 
-# 1) Class Grade Distribution (Histogram)
-st.subheader("1) Class Grade Distribution (Histogram)")
-q = scoped_query()
-if USE_INGESTED:
-    rows = list(col("grades_ingested").find(q, {"Grade":1}).limit(300000))
-    df1 = pd.DataFrame([r for r in rows if r.get("Grade") is not None])
-else:
-    rows = list(col("enrollments").find(q, {"grade":1}).limit(300000))
-    df1 = pd.DataFrame([{"Grade": r.get("grade")} for r in rows if r.get("grade") is not None])
-if not df1.empty:
-    fig1 = plt.figure(); plt.hist(df1["Grade"], bins=40); plt.xlabel("Grade"); plt.ylabel("Freq"); plt.title("Grade Distribution")
-    st.pyplot(fig1); fig_download_button(fig1, "faculty_grade_histogram.png")
-    st.text_area("Insight", value=f"{len(df1)} graded entries. Mean={df1['Grade'].mean():.2f}, Median={df1['Grade'].median():.2f}.", key="fac1")
-else:
-    st.info("No graded entries found for this scope.")
 
-# 2) Student Progress Tracker (Avg by Term)
-st.subheader("2) Student Progress Tracker (Avg by Term)")
-if USE_INGESTED:
-    rows = list(col("grades_ingested").find(q, {"Grade":1,"term":1}).limit(300000))
-    df2 = pd.DataFrame([{"term": f"{r.get('term',{}).get('school_year','')} S{r.get('term',{}).get('semester','')}",
-                         "Grade": r.get("Grade")} for r in rows if r.get("Grade") is not None])
-else:
-    rows = list(col("enrollments").find(q, {"grade":1,"term":1}).limit(300000))
-    df2 = pd.DataFrame([{"term": f"{r.get('term',{}).get('school_year','')} S{r.get('term',{}).get('semester','')}",
-                         "Grade": r.get("grade")} for r in rows if r.get("grade") is not None])
-if not df2.empty:
-    trend = df2.groupby("term", as_index=False).Grade.mean().sort_values("term")
-    st.dataframe(trend, use_container_width=True)
-    fig2 = plt.figure(); plt.plot(trend["term"], trend["Grade"], marker="o"); plt.xticks(rotation=45, ha="right")
-    plt.ylabel("Avg Grade"); plt.title("Average Grade by Term")
-    st.pyplot(fig2); df_download_button(trend, "faculty_progress_trend.csv"); fig_download_button(fig2, "faculty_progress_trend.png")
-else:
-    st.info("No data to compute term averages.")
+def _to_num_grade(x) -> float | None:
+    try:
+        v = float(x)
+        if pd.isna(v):
+            return None
+        return v
+    except Exception:
+        return None
 
-# 3) Subject Difficulty Heatmap (Fail %)
-st.subheader("3) Subject Difficulty Heatmap (Fail %)")
-if USE_INGESTED:
-    rows = list(col("grades_ingested").find(q, {"SubjectCode":1,"Remark":1,"term":1}).limit(300000))
-    df3 = pd.DataFrame([{"Subject": r.get("SubjectCode",""),
-                         "term": f"{r.get('term',{}).get('school_year','')} S{r.get('term',{}).get('semester','')}",
-                         "is_fail": 1 if r.get("Remark")=="FAILED" else 0} for r in rows])
-else:
-    rows = list(col("enrollments").find(q, {"subject.code":1,"remark":1,"term":1}).limit(300000))
-    df3 = pd.DataFrame([{"Subject": r.get("subject",{}).get("code",""),
-                         "term": f"{r.get('term',{}).get('school_year','')} S{r.get('term',{}).get('semester','')}",
-                         "is_fail": 1 if r.get("remark")=="FAILED" else 0} for r in rows])
-if not df3.empty:
-    grid = df3.groupby(["Subject","term"])["is_fail"].mean().reset_index()
-    st.dataframe(grid.pivot(index="Subject", columns="term", values="is_fail").fillna(0).round(2), use_container_width=True)
-    st.text_area("Insight", value="Higher values indicate higher failure rates.", key="fac3")
-else:
-    st.info("No data for fail rates.")
 
-# 4) Intervention Candidates (grade <75 or INC)
-st.subheader("4) Intervention Candidates")
-if USE_INGESTED:
-    q2 = scoped_query({"$or":[{"Grade":{"$lt":75}}, {"Remark":"INC"}]})
-    rows = list(col("grades_ingested").find(q2, {"StudentID":1,"SubjectCode":1,"Grade":1,"Remark":1,"term":1}).limit(20000))
-    df4 = pd.DataFrame([{"student_id": r.get("StudentID",""), "subject": r.get("SubjectCode",""),
-                         "term": f"{r.get('term',{}).get('school_year','')} S{r.get('term',{}).get('semester','')}",
-                         "grade": r.get("Grade"), "remark": r.get("Remark")} for r in rows])
-else:
-    q2 = scoped_query({"$or":[{"grade":{"$lt":75}}, {"remark":"INC"}]})
-    rows = list(col("enrollments").find(q2, {"student":1,"subject":1,"grade":1,"remark":1,"term":1}).limit(20000))
-    df4 = pd.DataFrame([{"student": r.get("student",{}).get("student_no",""), "subject": r.get("subject",{}).get("code",""),
-                         "term": f"{r.get('term',{}).get('school_year','')} S{r.get('term',{}).get('semester','')}",
-                         "grade": r.get("grade"), "remark": r.get("remark")} for r in rows])
-st.dataframe(df4, use_container_width=True, height=300); df_download_button(df4, "faculty_intervention.csv")
-st.text_area("Insight", value="Students at risk: grade < 75 or INC.", key="fac4")
+# ──────────────────────────────────────────────────────────────────────────────
+# Teacher lists & scope resolution (with offerings fallback)
+# ──────────────────────────────────────────────────────────────────────────────
 
-# 5) Grade Submission Status
-st.subheader("5) Grade Submission Status")
-if USE_INGESTED:
-    rows = list(col("grades_ingested").find(q, {"SubjectCode":1,"Grade":1}).limit(300000))
-    df5 = pd.DataFrame(rows)
-else:
-    rows = list(col("enrollments").find(q, {"subject.code":1,"grade":1}).limit(300000))
-    df5 = pd.DataFrame([{"SubjectCode": r.get("subject",{}).get("code",""), "Grade": r.get("grade")} for r in rows])
-status = df5.groupby("SubjectCode")["Grade"].apply(lambda s: (s.notna().sum(), s.size)).reset_index()
-status[["with_grade","total"]] = pd.DataFrame(status["Grade"].tolist(), index=status.index)
-status["pct_with_grade"] = (status["with_grade"]/status["total"]*100).round(2)
-status = status.drop(columns=["Grade"]).sort_values("pct_with_grade", ascending=False)
-st.dataframe(status.head(50), use_container_width=True); df_download_button(status, "faculty_submission_status.csv")
-st.text_area("Insight", value="Percent of records with grades per subject.", key="fac5")
+def _teacher_id_by_email(email: str) -> str | None:
+    if not email:
+        return None
+    t = col("teachers").find_one({"email": email}, {"teacher_id": 1})
+    return t.get("teacher_id") if t else None
 
-# 6) Custom Query Builder
-st.subheader("6) Custom Query Builder")
-with st.form("custom_query"):
-    subj = st.text_input("Subject Code (exact)", "")
-    min_g = st.number_input("Min grade", 0, 100, 0)
-    max_g = st.number_input("Max grade", 0, 100, 100)
-    submit = st.form_submit_button("Run")
-if submit:
-    src = "grades_ingested" if USE_INGESTED else "enrollments"
-    qf = scoped_query({})
-    if subj.strip():
-        qf["SubjectCode" if USE_INGESTED else "subject.code"] = subj.strip()
-    key_grade = "Grade" if USE_INGESTED else "grade"
-    qf[key_grade] = {"$gte": int(min_g), "$lte": int(max_g)}
-    res = list(col(src).find(qf).limit(2000))
-    dfr = pd.DataFrame(res); st.dataframe(dfr, use_container_width=True); df_download_button(dfr, "faculty_custom_query.csv")
-    st.text_area("Insight", value="Ad-hoc filtered results.", key="fac6")
 
-# 7) Students Grade Analytics (Per Teacher)
-st.subheader("7) Students Grade Analytics (Per Teacher)")
-if USE_INGESTED:
-    rows = list(col("grades_ingested").find(q, {"teacher.email":1,"Grade":1}).limit(400000))
-    df7 = pd.DataFrame([{"teacher": r.get("teacher",{}).get("email",""), "Grade": r.get("Grade")} for r in rows if r.get("Grade") is not None])
-else:
-    rows = list(col("enrollments").find(q, {"teacher.email":1,"grade":1}).limit(400000))
-    df7 = pd.DataFrame([{"teacher": r.get("teacher",{}).get("email",""), "Grade": r.get("grade")} for r in rows if r.get("grade") is not None])
-if not df7.empty:
-    stats = df7.groupby("teacher")["Grade"].agg(["count","mean","median","min","max"]).round(2).reset_index()
-    st.dataframe(stats, use_container_width=True); df_download_button(stats, "faculty_teacher_analytics.csv")
-    st.text_area("Insight", value="Per-teacher grade stats (compare distributions).", key="fac7")
-else:
-    st.info("No graded entries found.")
+def _offering_keys_for_teacher(email: str) -> Set[tuple]:
+    """
+    Build {(school_year, semester, subject_code)} a teacher handles via `offerings`.
+    offerings doc assumed to have: { teacher_id, subject_code, school_year, semester }
+    """
+    tid = _teacher_id_by_email(email)
+    if not tid:
+        return set()
+    keys: Set[tuple] = set()
+    for o in col("offerings").find({"teacher_id": tid},
+                                   {"subject_code": 1, "school_year": 1, "semester": 1}):
+        keys.add((o.get("school_year"), o.get("semester"), o.get("subject_code")))
+    return keys
+
+
+def list_teacher_emails_from_enrollments() -> List[Tuple[str, str]]:
+    """[(name, email)] discovered from enrollments (if present)."""
+    pipe = [
+        {"$match": {"teacher.email": {"$exists": True, "$ne": ""}}},
+        {"$group": {"_id": "$teacher.email", "name": {"$first": "$teacher.name"}}},
+        {"$sort": {"_id": 1}},
+    ]
+    out = []
+    for r in col("enrollments").aggregate(pipe):
+        em = (r.get("_id") or "").strip().lower()
+        nm = r.get("name") or ""
+        if em:
+            out.append((nm or em, em))
+    return out
+
+
+def list_all_teachers() -> List[Tuple[str, str]]:
+    """[(name, email)] from `teachers` collection (for admin/registrar picker)."""
+    out: List[Tuple[str, str]] = []
+    for t in col("teachers").find({}, {"name": 1, "email": 1}).sort("email", 1):
+        em = (t.get("email") or "").strip().lower()
+        nm = t.get("name") or em
+        if em:
+            out.append((nm, em))
+    return out
+
+
+def scope_df_to_teacher(df: pd.DataFrame, teacher_email: str) -> tuple[pd.DataFrame, str]:
+    """
+    Try to scope by teacher:
+      1) If df has teacher_email (from enrollments), use it.
+      2) Else fallback to offerings: match (school_year, semester, subject_code).
+    Returns (scoped_df, how).
+    """
+    target = (teacher_email or "").strip().lower()
+    if not target:
+        return df.iloc[0:0], "no_email"
+
+    # Approach 1: enrollments already have teacher_email
+    if "teacher_email" in df.columns:
+        dfe = df[df["teacher_email"].str.lower() == target]
+        if len(dfe):
+            return dfe, "enrollments_teacher_email"
+
+    # Approach 2: offerings fallback based on term + subject
+    keys = _offering_keys_for_teacher(target)
+    if not keys:
+        return df.iloc[0:0], "no_offerings"
+
+    mask = df.apply(
+        lambda r: (r.get("term_school_year"), r.get("term_semester"), r.get("subject_code")) in keys,
+        axis=1,
+    )
+    return df[mask], "offerings_fallback"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Data loader
+# ──────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def load_enrollments_df_all() -> pd.DataFrame:
+    """
+    Load *all* enrollments and flatten into a DataFrame.
+    We scope later (so offerings fallback can work even if teacher.email is absent).
+    """
+    proj = {
+        "grade": 1, "remark": 1,
+        "term.school_year": 1, "term.semester": 1,
+        "student.name": 1, "student.student_no": 1,
+        "subject.code": 1, "subject.title": 1,
+        "teacher.email": 1, "teacher.name": 1,
+        "program.program_code": 1,
+    }
+    rows = list(col("enrollments").find({}, proj))
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "student_no", "student_name",
+            "subject_code", "subject_title",
+            "grade", "remark",
+            "term_label", "term_school_year", "term_semester",
+            "teacher_email", "teacher_name",
+            "program_code",
+        ])
+
+    def flat(e):
+        term = e.get("term") or {}
+        stu  = e.get("student") or {}
+        sub  = e.get("subject") or {}
+        tch  = e.get("teacher") or {}
+        prog = e.get("program") or {}
+        sy   = term.get("school_year")
+        sem  = term.get("semester")
+        return {
+            "student_no": stu.get("student_no"),
+            "student_name": stu.get("name"),
+            "subject_code": sub.get("code"),
+            "subject_title": sub.get("title"),
+            "grade": _to_num_grade(e.get("grade")),
+            "remark": e.get("remark"),
+            "term_label": _term_label(sy, sem),
+            "term_school_year": sy,
+            "term_semester": sem,
+            "teacher_email": (tch.get("email") or "").strip().lower(),
+            "teacher_name": tch.get("name"),
+            "program_code": prog.get("program_code"),
+        }
+
+    df = pd.DataFrame([flat(r) for r in rows])
+    return df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Page
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main():
+    u = current_user() or {}
+    role = (u.get("role") or "").lower()
+    user_email = (u.get("email") or "").strip().lower()
+
+    st.title("🏫 Faculty Dashboard")
+    st.caption("Teacher scope applies automatically for faculty. Registrars/Admins can filter by teacher.")
+
+    df = load_enrollments_df_all()
+
+    # ── Choose the teacher context
+    teacher_email_to_scope: Optional[str] = None
+    if role in ("faculty", "teacher"):
+        teacher_email_to_scope = user_email
+        st.caption(f"Signed in as **{user_email}** (faculty) — auto-scoped.")
+    else:
+        # registrars/admins: pick a teacher (prefer teachers collection;
+        # if none, gracefully fallback to those seen in enrollments)
+        all_teachers = list_all_teachers()
+        if not all_teachers:
+            all_teachers = list_teacher_emails_from_enrollments()
+
+        if all_teachers:
+            display = [f"{nm}  ({em})" for nm, em in all_teachers]
+            picked = st.selectbox("Filter by teacher (Registrar/Admin)", options=["(All)"] + display, index=0)
+            if picked != "(All)":
+                idx = display.index(picked)
+                teacher_email_to_scope = all_teachers[idx][1]
+        else:
+            st.info("No teachers found. Showing **all enrollments** for the selected filters.")
+
+    # ── Scope to teacher if one is set
+    if teacher_email_to_scope:
+        df, how = scope_df_to_teacher(df, teacher_email_to_scope)
+        if how == "enrollments_teacher_email":
+            st.caption("Scoped by teacher email present in enrollments.")
+        elif how == "offerings_fallback":
+            st.caption("Scoped by offerings mapping (since enrollments lack teacher email).")
+        elif how == "no_offerings":
+            st.info("No offerings found for this teacher in the selected filters.")
+        elif how == "no_email":
+            st.info("No teacher email provided.")
+    else:
+        st.info("No teacher filter selected; showing **all enrollments** instead.")
+
+    # ── Quick filters
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        terms = sorted(df["term_label"].dropna().unique(), key=_term_sort_key)
+        sel_terms = st.multiselect("Term(s)", options=terms, default=terms)
+    with c2:
+        subjects = sorted(df["subject_code"].dropna().unique())
+        sel_subjects = st.multiselect("Subject(s)", options=subjects, default=subjects)
+    with c3:
+        progs = sorted(df["program_code"].dropna().unique())
+        sel_progs = st.multiselect("Program(s)", options=progs, default=progs)
+
+    if sel_terms:
+        df = df[df["term_label"].isin(sel_terms)]
+    if sel_subjects:
+        df = df[df["subject_code"].isin(sel_subjects)]
+    if sel_progs:
+        df = df[df["program_code"].isin(sel_progs)]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 1) Class Grade Distribution (Histogram)
+    # ──────────────────────────────────────────────────────────────────────────
+    st.subheader("1) Class Grade Distribution (Histogram)")
+    graded = df.dropna(subset=["grade"])
+    if graded.empty:
+        st.info("No graded entries found for this scope.")
+    else:
+        # 60–100 in 5-pt bins
+        bins = list(range(60, 101, 5))
+        hist = pd.cut(graded["grade"], bins=bins, right=True, include_lowest=True).value_counts().sort_index()
+        chart_df = pd.DataFrame({"range": hist.index.astype(str), "count": hist.values}).set_index("range")
+        st.bar_chart(chart_df)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 2) Student Progress Tracker (Avg by Term)
+    # ──────────────────────────────────────────────────────────────────────────
+    st.subheader("2) Student Progress Tracker (Avg by Term)")
+    if graded.empty:
+        st.info("No data to compute term averages.")
+    else:
+        g = (
+            graded.groupby("term_label", as_index=False)["grade"]
+            .mean()
+            .rename(columns={"grade": "avg_grade"})
+        )
+        g = g.sort_values(by="term_label", key=lambda s: s.map(_term_sort_key)).set_index("term_label")
+        st.line_chart(g)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 3) Subject Difficulty Heatmap (Fail %)
+    # ──────────────────────────────────────────────────────────────────────────
+    st.subheader("3) Subject Difficulty Heatmap (Fail %)")
+    if graded.empty:
+        st.info("No data for fail rates.")
+    else:
+        tmp = graded.copy()
+        tmp["is_fail"] = tmp["grade"] < 75
+        fail = (
+            tmp.groupby("subject_code", as_index=False)
+            .agg(total=("grade", "size"), fails=("is_fail", "sum"))
+        )
+        fail["fail_rate_%"] = (fail["fails"] / fail["total"] * 100).round(2)
+        if fail.empty:
+            st.info("No subjects to display.")
+        else:
+            st.dataframe(fail.sort_values("fail_rate_%", ascending=False),
+                         use_container_width=True)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 4) Intervention Candidates (latest term)
+    # ──────────────────────────────────────────────────────────────────────────
+    st.subheader("4) Intervention Candidates")
+    if graded.empty:
+        st.info("No graded entries.")
+    else:
+        latest_term = None
+        if not graded["term_label"].isna().all() and graded["term_label"].dropna().size:
+            latest_term = sorted(graded["term_label"].dropna().unique(), key=_term_sort_key)[-1]
+        cur = graded if latest_term is None else graded[graded["term_label"] == latest_term]
+        risk = cur[cur["grade"] < 75].copy().sort_values(["student_name", "grade"])
+        if risk.empty:
+            st.success("No at-risk students in the latest term.")
+        else:
+            show = risk[["student_no", "student_name", "subject_code", "grade", "term_label"]].rename(
+                columns={
+                    "student_no": "Student No",
+                    "student_name": "Student",
+                    "subject_code": "Subject",
+                    "grade": "Grade",
+                    "term_label": "Term",
+                }
+            )
+            st.dataframe(show, use_container_width=True,
+                         height=min(500, 35 + 28 * len(show)))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 5) Grade Submission Status
+    # ──────────────────────────────────────────────────────────────────────────
+    st.subheader("5) Grade Submission Status")
+    df_status = df.copy()  # keep ungraded rows for this
+    if df_status.empty:
+        st.info("No enrollments to summarize.")
+    else:
+        status = (
+            df_status.groupby("subject_code")
+            .agg(total=("grade", "size"), graded=("grade", lambda s: s.notna().sum()))
+            .reset_index()
+        )
+        status["completion_%"] = (status["graded"] / status["total"] * 100).round(1)
+        status = status.rename(columns={
+            "subject_code": "Subject",
+            "total": "Total Enrollments",
+            "graded": "Graded Count",
+            "completion_%": "Completion %",
+        }).sort_values(["Completion %", "Subject"], ascending=[True, True])
+        st.dataframe(status, use_container_width=True)
+
+
+if __name__ == "__main__":
+    main()
