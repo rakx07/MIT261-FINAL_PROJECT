@@ -1,4 +1,4 @@
-# utils/auth.py
+# utils/auth.py — authentication helpers only (no page_config here)
 from __future__ import annotations
 import secrets, string
 from typing import List, Dict, Optional, Tuple
@@ -6,9 +6,10 @@ from datetime import datetime, timezone
 
 import bcrypt
 from bson import ObjectId
+import streamlit as st
+
 from db import col
 
-# ---------------- core helpers ----------------
 def _users():
     return col("users")
 
@@ -22,7 +23,6 @@ def _hash(pw: str) -> str:
     return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 def _check_pw(pw: str, stored) -> bool:
-    """Accept string or bytes hashes."""
     if not stored:
         return False
     try:
@@ -31,12 +31,11 @@ def _check_pw(pw: str, stored) -> bool:
         if isinstance(stored, str):
             return bcrypt.checkpw(pw.encode("utf-8"), stored.encode("utf-8"))
     except Exception:
-        pass
-    return False
+        return False
+    return True
 
 def _public(u: dict) -> dict:
-    if not u: 
-        return {}
+    if not u: return {}
     out = dict(u)
     out.pop("password_hash", None)
     out.pop("reset_token", None)
@@ -48,7 +47,7 @@ def _ensure_indexes():
     _users().create_index("email", unique=True)
     _users().create_index([("role", 1), ("active", 1)])
 
-# ---------------- CRUD ----------------
+# CRUD
 def get_user(email: str) -> Optional[dict]:
     return _users().find_one({"email": _nemail(email)})
 
@@ -91,7 +90,7 @@ def verify_login(email: str, password: str) -> Optional[dict]:
     if not _check_pw(password, u.get("password_hash")):
         return None
     _users().update_one({"_id": u["_id"]}, {"$set": {"last_login_at": _now()}})
-    return u
+    return _public(u)
 
 def require_password_change(email: str, flag: bool = True) -> bool:
     return _users().update_one({"email": _nemail(email)},
@@ -106,7 +105,6 @@ def deactivate_user(email: str) -> bool:
                                {"$set": {"active": False, "updated_at": _now()}}).modified_count == 1
 
 def ensure_default_admin(email: str, password: str = "Admin@1234", reset_password: bool = True) -> dict:
-    """Create or repair admin. If exists and reset_password=True, set new password + force change."""
     _ensure_indexes()
     email = _nemail(email)
     u = get_user(email)
@@ -124,52 +122,39 @@ def ensure_default_admin(email: str, password: str = "Admin@1234", reset_passwor
     u.update(updates)
     return _public(u)
 
-# ---------------- temp password generator ----------------
+# Temp passwords & imports
 def _gen_temp_pw(n: int = 12) -> str:
-    """Guaranteed complexity: lower, upper, digit, symbol + random rest."""
     n = max(8, n)
-    pools = [
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    seed = [
         secrets.choice(string.ascii_lowercase),
         secrets.choice(string.ascii_uppercase),
         secrets.choice(string.digits),
         secrets.choice("!@#$%^&*"),
-    ]
-    rest_len = n - len(pools)
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-    pools += [secrets.choice(alphabet) for _ in range(rest_len)]
-    # Fisher–Yates shuffle
-    for i in range(len(pools)-1, 0, -1):
-        j = secrets.randbelow(i+1)
-        pools[i], pools[j] = pools[j], pools[i]
-    return "".join(pools)
+    ] + [secrets.choice(alphabet) for _ in range(n - 4)]
+    for i in range(len(seed)-1, 0, -1):
+        j = secrets.randbelow(i+1); seed[i], seed[j] = seed[j], seed[i]
+    return "".join(seed)
 
-# ---------------- imports (teachers/students) ----------------
 def import_from_collection(source: str, role: str, email_field: str, name_field: str,
                            must_change_password: bool = True) -> Tuple[List[Dict[str, str]], int, int]:
     created, scanned, inserted = [], 0, 0
     for d in col(source).find({}, {email_field: 1, name_field: 1}):
         scanned += 1
-        email = _nemail(d.get(email_field, ""))
-        name  = d.get(name_field) or email
-        if not email or get_user(email):
-            continue
+        email = _nemail(d.get(email_field, "")); name = d.get(name_field) or email
+        if not email or get_user(email): continue
         temp = _gen_temp_pw()
         _users().insert_one({
             "email": email, "name": name, "role": role, "active": True,
-            "password_hash": _hash(temp),
-            "must_change_password": bool(must_change_password),
-            "source": f"import_{source}",
-            "created_at": _now(), "updated_at": _now()
+            "password_hash": _hash(temp), "must_change_password": bool(must_change_password),
+            "source": f"import_{source}", "created_at": _now(), "updated_at": _now()
         })
-        created.append({"email": email, "name": name, "role": role, "temp_password": temp})
-        inserted += 1
+        created.append({"email": email, "name": name, "role": role, "temp_password": temp}); inserted += 1
     return created, scanned, inserted
 
-# ---------------- optional reset tokens ----------------
 def start_password_reset(email: str) -> Optional[str]:
-    u = get_user(email)
-    if not u: 
-        return None
+    u = get_user(email); 
+    if not u: return None
     token = secrets.token_urlsafe(24)
     _users().update_one({"_id": u["_id"]},
                         {"$set": {"reset_token": token, "updated_at": _now(), "must_change_password": True}})
@@ -177,36 +162,36 @@ def start_password_reset(email: str) -> Optional[str]:
 
 def complete_password_reset(email: str, token: str, new_password: str) -> bool:
     u = get_user(email)
-    if not u or token != u.get("reset_token"):
-        return False
+    if not u or token != u.get("reset_token"): return False
     return set_password(email, new_password, clear_reset=True)
 
-# ---------------- Streamlit session helpers ----------------
-import streamlit as st
+def issue_temp_password(email: str, n: int = 12) -> Optional[Dict[str, str]]:
+    u = get_user(email)
+    if not u: return None
+    temp = _gen_temp_pw(n)
+    _users().update_one({"_id": u["_id"]}, {"$set": {
+        "password_hash": _hash(temp), "must_change_password": True,
+        "password_changed_at": _now(), "updated_at": _now()
+    }})
+    return {"email": u["email"], "name": u.get("name", u["email"]), "role": u.get("role", ""), "temp_password": temp}
 
+# Streamlit session helpers
 def current_user() -> dict:
-    """Return the currently logged-in user dict stored in session_state, or {}."""
     return st.session_state.get("user") or {}
 
-def set_current_user(user: Optional[dict]) -> None:
-    """Set/clear the logged-in user in session_state."""
+def get_current_user() -> dict:
+    return current_user()
+
+def set_current_user(user: dict | None) -> None:
     st.session_state["user"] = user or {}
 
+def sign_out() -> None:
+    st.session_state.pop("user", None)
+
 def require_role(*roles: str) -> dict:
-    """
-    Stop the app unless the logged-in user has one of the allowed roles.
-    Returns the user dict if authorized.
-    """
     u = current_user()
     if not u:
-        st.error("You must sign in to view this page.")
-        st.stop()
+        st.error("You must sign in to view this page."); st.stop()
     if roles and u.get("role") not in roles:
-        st.error("You are not authorized to view this page.")
-        st.stop()
+        st.error("You are not authorized to view this page."); st.stop()
     return u
-
-# --------- compatibility alias (prevents ImportError) ----------
-def get_current_user() -> dict:
-    """Backward-compatible alias for legacy imports."""
-    return current_user()

@@ -1,20 +1,8 @@
-# app.py
-# ─────────────────────────────────────────────────────────────────────────────
-# MIT261 Student Analytics — Entry / Login
-# - Single place that sets page config
-# - Seeds demo accounts on demand
-# - Verifies bcrypt password
-# - Redirects to role page with st.switch_page()
-# ─────────────────────────────────────────────────────────────────────────────
-
+# app.py — MIT261 Student Analytics (entry)
+from __future__ import annotations
 import streamlit as st
-from datetime import datetime
-import bcrypt
-from pymongo.errors import PyMongoError
 
-# Our tiny DB helper (already in your repo)
-from db import col
-
+# ── Page config MUST be the first Streamlit call
 st.set_page_config(
     page_title="MIT261 Student Analytics",
     page_icon="🎓",
@@ -22,147 +10,139 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Hide default Streamlit chrome a bit
+# Import after page_config
+from utils.auth import (
+    verify_login, ensure_default_admin, import_from_collection,
+    current_user, get_current_user, set_current_user, sign_out,
+)
+from db import col
+
+# ── Cross-version rerun helper (Streamlit >=1.30 uses st.rerun)
+def _rerun():
+    r = getattr(st, "rerun", None)
+    if callable(r):
+        r()
+    else:
+        # older Streamlit
+        e = getattr(st, "experimental_rerun", None)
+        if callable(e):
+            e()
+
+# ---------- CSS ----------
 st.markdown(
     """
     <style>
-      #MainMenu, header, footer {visibility: hidden;}
-      .small-note {opacity: .7; font-size: 0.9rem;}
-      .tight {padding-top: .35rem; padding-bottom: .35rem;}
+      .main { padding-top: 1rem; }
+      .login-card {
+        background: #0f131a; border:1px solid rgba(255,255,255,.08);
+        border-radius:16px; padding:1.2rem; box-shadow:0 6px 18px rgba(0,0,0,.35);
+      }
+      .muted { color: rgba(255,255,255,.65); font-size:.92rem; }
+      section[data-testid="stSidebar"] {
+        background:#161a22; border-right:1px solid rgba(255,255,255,.08);
+      }
+      section[data-testid="stSidebar"] > div { height:100%; display:flex; flex-direction:column; }
+      section[data-testid="stSidebar"] [data-testid="stSidebarNav"] { flex:1 1 auto; padding-top:.25rem; }
+      section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a {
+        display:block; padding:.55rem .65rem; margin:.15rem .5rem;
+        border-radius:.6rem; font-weight:600; text-decoration:none !important;
+        color: rgba(255,255,255,.92);
+      }
+      section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a:hover {
+        background: rgba(255,255,255,.07);
+      }
+      section[data-testid="stSidebar"] [data-testid="stSidebarNav"] a[aria-current="page"] {
+        background: linear-gradient(135deg,#2d6cdf 0%,#6b8ff5 100%);
+        color:#fff !important; box-shadow:0 0 0 1px rgba(255,255,255,.05) inset;
+      }
+      .sb-footer { border-top:1px solid rgba(255,255,255,.08); padding:.85rem .8rem 1rem .8rem; }
+      .sb-user { display:flex; align-items:center; gap:.6rem; margin-bottom:.55rem; }
+      .sb-user .badge { font-weight:700; font-size:.75rem; padding:.10rem .4rem;
+                        background:#243042; color:#dfe7ff; border-radius:.35rem;
+                        border:1px solid rgba(255,255,255,.06); }
+      .sb-user .email { color:#cfd6e6; font-size:.87rem; }
+      .danger-btn > button {
+        width:100%; border:1px solid rgba(255,255,255,.10) !important;
+        background: linear-gradient(135deg,#e74a54 0%,#d12f53 100%) !important;
+        color:#fff !important; font-weight:700 !important; border-radius:.6rem !important;
+      }
+      /* hide sidebar nav when logged out */
+      .hide-nav section[data-testid="stSidebar"] [data-testid="stSidebarNav"] { display:none; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+def render_sidebar_footer(user: dict) -> None:
+    if not user:
+        return
+    with st.sidebar:
+        st.markdown('<div class="sb-footer">', unsafe_allow_html=True)
+        st.markdown(
+            f"""<div class="sb-user">
+                   <div class="badge">{(user.get("role") or "").upper()}</div>
+                   <div class="email">{user.get("email","")}</div>
+                 </div>""",
+            unsafe_allow_html=True,
+        )
+        if st.container().button("Log out", type="secondary", use_container_width=True, key="logout_btn"):
+            sign_out()
+            _rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-# ───────────────────────────── Helpers ──────────────────────────────────────
-def _b(x):  # bytes helper
-    return x if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8")
+def render_login():
+    # visually collapse sidebar nav while logged out
+    st.markdown("<div class='hide-nav'></div>", unsafe_allow_html=True)
 
+    st.title("🎓 MIT261 Student Analytics")
+    st.caption("Please sign in to continue.")
 
-def hash_pw(plain: str) -> str:
-    return bcrypt.hashpw(_b(plain), bcrypt.gensalt()).decode("utf-8")
+    col1, col2 = st.columns([1, 1], gap="large")
+    with col1:
+        st.markdown('<div class="login-card">', unsafe_allow_html=True)
+        email = st.text_input("Email", placeholder="you@su.edu", key="login_email")
+        pw = st.text_input("Password", type="password", placeholder="••••••••", key="login_pw")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Login", type="primary", use_container_width=True):
+                u = verify_login(email, pw)
+                if not u:
+                    st.error("Invalid credentials.")
+                else:
+                    set_current_user(u)
+                    _rerun()
+        with c2:
+            if st.button("Create default admin", use_container_width=True):
+                ensure_default_admin("admin@su.edu", password="Admin@1234", reset_password=True)
+                st.success("Created/updated: **admin@su.edu / Admin@1234**")
+        st.markdown("</div>", unsafe_allow_html=True)
 
+    with col2:
+        st.markdown('<div class="login-card">', unsafe_allow_html=True)
+        st.markdown("**Quick tools**")
+        st.markdown("<div class='muted'>Import accounts from existing collections.</div>", unsafe_allow_html=True)
+        a, b = st.columns(2)
+        with a:
+            if st.button("Import Teachers ➜ Users", use_container_width=True):
+                _, scanned, inserted = import_from_collection("teachers", "faculty", "email", "name")
+                st.success(f"Imported {inserted} of {scanned}.")
+        with b:
+            if st.button("Import Students ➜ Users", use_container_width=True):
+                _, scanned, inserted = import_from_collection("students", "student", "email", "Name")
+                st.success(f"Imported {inserted} of {scanned}.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-def verify_pw(plain: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(_b(plain), _b(hashed))
-    except Exception:
-        return False
-
-
-def get_user_by_email(email: str):
-    if not email:
-        return None
-    return col("users").find_one({"email": email.strip().lower()})
-
-
-def upsert_user(email: str, name: str, role: str, password_plain: str):
-    now = datetime.utcnow()
-    email_n = email.strip().lower()
-    doc = {
-        "email": email_n,
-        "name": name,
-        "role": role,
-        "password": hash_pw(password_plain),
-        "active": True,
-        "updated_at": now,
-    }
-    col("users").update_one(
-        {"email": email_n},
-        {"$set": doc, "$setOnInsert": {"created_at": now}},
-        upsert=True,
-    )
-
-
-def create_sample_accounts():
-    # Registrar / Faculty / Student / Admin
-    upsert_user("registrar@su.edu", "Registrar", "registrar", "reg123")
-    upsert_user("0005@su.edu", "Riley Santiago", "faculty", "teach123")
-    upsert_user("s00001@students.su.edu", "Morgan Querubin", "student", "stud123")
-    upsert_user("admin@su.edu", "Site Admin", "admin", "admin123")
-
-
-def reset_demo_accounts():
-    col("users").delete_many(
-        {"email": {"$in": ["registrar@su.edu", "0005@su.edu", "s00001@students.su.edu", "admin@su.edu"]}}
-    )
-    create_sample_accounts()
-
-
-def go_to_role_home(role: str):
-    role = (role or "").lower()
-    # These are your existing pages
-    if role == "registrar":
-        st.switch_page("pages/1_Registrar.py")
-    elif role == "faculty":
-        st.switch_page("pages/2_Faculty.py")
-    elif role == "student":
-        st.switch_page("pages/3_Student.py")
-    elif role == "admin":
-        st.switch_page("pages/9_Admin_Users.py")
-    else:
-        st.warning("Unknown role; ask an admin to update your account.")
-
-
-# ───────────────────────────── UI ───────────────────────────────────────────
-def login_view():
-    st.markdown("### 🎓 MIT261 Student Analytics")
-    st.markdown("<div class='small-note'>Sign in</div>", unsafe_allow_html=True)
-
-    with st.container():
-        email = st.text_input("Email", key="login_email", value="", placeholder="you@su.edu")
-        pw_col1, pw_col2 = st.columns([1, 14])
-        with pw_col1:
-            st.write("")  # spacer
-        password = st.text_input("Password", type="password", key="login_pw")
-
-        b1, b2 = st.columns([1, 1])
-        with b1:
-            do_login = st.button("Login", use_container_width=True)
-        with b2:
-            do_seed = st.button("Create sample accounts", use_container_width=True)
-
-        # Optional tiny reset button
-        if st.button("Reset demo accounts", type="secondary"):
-            reset_demo_accounts()
-            st.success("Demo accounts reset. Try registrar@su.edu / reg123")
-            st.stop()
-
-    if do_seed:
-        try:
-            create_sample_accounts()
-            st.success("Sample accounts created. Try registrar@su.edu / reg123")
-        except PyMongoError as e:
-            st.error(f"Failed creating users: {e}")
+def main():
+    user = get_current_user() or current_user()
+    if not user:
+        render_login()
         st.stop()
 
-    if do_login:
-        user = get_user_by_email(email)
-        if not user or not user.get("password") or not verify_pw(password, user["password"]):
-            st.error("Invalid credentials.")
-            st.stop()
+    st.title("🎓 MIT261 Student Analytics")
+    st.caption(f"Logged in as **{user.get('email','')}** · role: **{user.get('role','')}**")
+    render_sidebar_footer(user)
+    st.info("Use the sidebar to open **Registrar**, **Faculty**, or **Student** dashboards. "
+            "Access is filtered by your role.")
 
-        if not user.get("active", True):
-            st.error("Account is disabled. Contact an admin.")
-            st.stop()
-
-        # Save to session and route
-        st.session_state.user = {
-            "email": user["email"],
-            "name": user.get("name", ""),
-            "role": user.get("role", ""),
-        }
-        go_to_role_home(user.get("role", ""))
-
-
-def auto_route_if_logged_in():
-    u = st.session_state.get("user")
-    if u and u.get("role"):
-        go_to_role_home(u["role"])
-
-
-# ───────────────────────────── Entry ────────────────────────────────────────
 if __name__ == "__main__":
-    auto_route_if_logged_in()
-    login_view()
+    main()
