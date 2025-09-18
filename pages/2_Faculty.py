@@ -9,7 +9,9 @@ import streamlit as st
 from db import col
 from utils.auth import current_user
 
-
+from utils.auth import require_role
+# teachers see only their scope; registrar/admin can use the teacher filter
+user = require_role("teacher", "registrar", "admin")
 # ──────────────────────────────────────────────────────────────────────────────
 # Small helpers
 # ──────────────────────────────────────────────────────────────────────────────

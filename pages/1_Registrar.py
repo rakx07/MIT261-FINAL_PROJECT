@@ -9,7 +9,8 @@ import matplotlib.pyplot as plt
 
 from db import col  # uses your existing db.py helper
 
-
+from utils.auth import require_role
+user = require_role("registrar", "admin")   # only registrar/admin may open
 # -----------------------------
 # Small helpers (robust parsing)
 # -----------------------------

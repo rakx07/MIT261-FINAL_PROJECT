@@ -1,332 +1,317 @@
 # pages/3_Student.py
-import io
-import re
-import streamlit as st
+
+from __future__ import annotations
+import math
+from typing import Optional, Tuple, List
+
 import pandas as pd
-import matplotlib.pyplot as plt
+import streamlit as st
+
 from db import col
+from utils.auth import require_role, get_current_user
 
 
-def guard_role(*roles):
-    u = st.session_state.get("user")
-    if not u:
-        st.error("Please log in from the home page."); st.stop()
-    if roles and u.get("role") not in roles:
-        st.warning(f"Access restricted to: {', '.join(roles)}"); st.stop()
-    return u
+# ----------------------------
+# Helpers
+# ----------------------------
 
-user = guard_role("admin", "student", "registrar", "teacher")
-
-st.title("🎒 Student Dashboard")
-
-# ── helpers / source detection
-def has_collection(name):
-    try: return name in col(name).database.list_collection_names()
-    except Exception: return False
-
-def nonempty_count(name):
-    try: return (col(name).estimated_document_count() or 0) > 0
-    except Exception: return False
-
-MODE = "ingested"
-if has_collection("enrollments") and nonempty_count("enrollments"):
-    MODE = "enrollments"
-elif has_collection("grades") and nonempty_count("grades"):
-    MODE = "grades"
-
-def weighted_mean(grades, units):
+def _term_label(sy: str | None, sem: int | None) -> str:
+    if not sy:
+        return "—"
     try:
-        if units is not None and len(units) and pd.Series(units).notna().any():
-            g = pd.Series(grades).astype(float)
-            u = pd.Series(units).fillna(0).astype(float)
-            if (u > 0).any():
-                return (g * u).sum() / u.sum()
+        s = int(sem or 0)
     except Exception:
-        pass
-    s = pd.Series(grades)
-    if s.empty: return float("nan")
-    return s.astype(float).mean()
+        s = 0
+    return f"{sy} S{s}" if s else sy
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Roster loading with role restrictions
-# ───────────────────────────────────────────────────────────────────────────────
-def roster_for_registrar_or_admin():
+
+def _term_sort_key(label: str) -> tuple[int, int]:
+    """
+    Sort "2023-2024 S1" < "2023-2024 S2" < "2024-2025 S1" properly.
+    """
+    if not isinstance(label, str) or " S" not in label:
+        return (0, 0)
+    sy, s = label.split(" S", 1)
+    try:
+        start_year = int(sy.split("-")[0])
+    except Exception:
+        start_year = 0
+    try:
+        sem = int(s)
+    except Exception:
+        sem = 0
+    return (start_year, sem)
+
+
+def _to_num_grade(x) -> float | None:
+    try:
+        v = float(x)
+        if math.isnan(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _flatten(e: dict) -> dict:
+    term = e.get("term") or {}
+    stu = e.get("student") or {}
+    sub = e.get("subject") or {}
+    prog = e.get("program") or {}
+    tch = e.get("teacher") or {}
+    return {
+        "student_no": stu.get("student_no"),
+        "student_name": stu.get("name"),
+        "student_email": (stu.get("email") or "").strip().lower(),
+        "subject_code": sub.get("code"),
+        "subject_title": sub.get("title"),
+        "units": sub.get("units"),
+        "grade": _to_num_grade(e.get("grade")),
+        "remark": e.get("remark"),
+        "term_label": _term_label(term.get("school_year"), term.get("semester")),
+        "program_code": prog.get("program_code"),
+        "teacher_name": tch.get("name"),
+        "teacher_email": (tch.get("email") or "").strip().lower(),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def _load_enrollments_by_email(email: str) -> pd.DataFrame:
+    email = (email or "").strip().lower()
+    rows = list(
+        col("enrollments").find(
+            {"student.email": email},
+            {
+                "term.school_year": 1,
+                "term.semester": 1,
+                "student.student_no": 1,
+                "student.name": 1,
+                "student.email": 1,
+                "subject.code": 1,
+                "subject.title": 1,
+                "subject.units": 1,
+                "program.program_code": 1,
+                "teacher.name": 1,
+                "teacher.email": 1,
+                "grade": 1,
+                "remark": 1,
+            },
+        )
+    )
+    return pd.DataFrame([_flatten(r) for r in rows]) if rows else pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
+def _load_enrollments_by_studentno(student_no: str) -> pd.DataFrame:
+    rows = list(
+        col("enrollments").find(
+            {"student.student_no": student_no},
+            {
+                "term.school_year": 1,
+                "term.semester": 1,
+                "student.student_no": 1,
+                "student.name": 1,
+                "student.email": 1,
+                "subject.code": 1,
+                "subject.title": 1,
+                "subject.units": 1,
+                "program.program_code": 1,
+                "teacher.name": 1,
+                "teacher.email": 1,
+                "grade": 1,
+                "remark": 1,
+            },
+        )
+    )
+    return pd.DataFrame([_flatten(r) for r in rows]) if rows else pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
+def _list_students_for_picker() -> List[Tuple[str, str, str]]:
+    """
+    For registrar/admin/teacher view: return a sorted list of students present
+    in enrollments as (label, student_no, email) where label = "Name (Sxxxxx)".
+    """
+    pipe = [
+        {"$group": {
+            "_id": "$student.student_no",
+            "name": {"$first": "$student.name"},
+            "email": {"$first": "$student.email"}
+        }},
+        {"$sort": {"_id": 1}}
+    ]
     out = []
-    try:
-        # users(role=student) first
-        for u in col("users").find({"role":"student"}, {"email":1,"name":1}).sort("email", 1).limit(5000):
-            out.append({"email": u.get("email",""), "name": u.get("name",""), "student_no": ""})
-        # fallback to students
-        if not out:
-            for sdoc in col("students").find({}, {"Email":1,"email":1,"Name":1,"name":1,"student_no":1}).limit(10000):
-                out.append({
-                    "email": sdoc.get("Email") or sdoc.get("email") or "",
-                    "name":  sdoc.get("Name")  or sdoc.get("name")  or "",
-                    "student_no": sdoc.get("student_no") or ""
-                })
-    except Exception:
-        pass
+    for r in col("enrollments").aggregate(pipe):
+        sno = r.get("_id")
+        nm = r.get("name") or ""
+        em = (r.get("email") or "").strip().lower()
+        if sno:
+            out.append((f"{nm} ({sno})", sno, em))
     return out
 
-def roster_for_teacher(teacher_email: str):
-    """
-    Pull unique students taught by this teacher from enrollments.
-    If enrollments aren’t available, returns empty (teacher view will show message).
-    """
-    out = []
-    if not (has_collection("enrollments") and nonempty_count("enrollments")):
-        return out
-    seen = set()
-    rows = col("enrollments").find({"teacher.email": teacher_email},
-                                   {"student.email":1,"student.name":1,"student.student_no":1}).limit(300000)
-    for r in rows:
-        s = r.get("student",{})
-        email = (s.get("email") or "").strip()
-        name  = (s.get("name") or "").strip()
-        sno   = (s.get("student_no") or "").strip()
-        key = (email or sno or name).lower()
-        if key and key not in seen:
-            out.append({"email": email, "name": name, "student_no": sno})
-            seen.add(key)
-    return sorted(out, key=lambda x: (x["email"], x["name"], x["student_no"]))
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Student selection with role logic
-# ───────────────────────────────────────────────────────────────────────────────
-if user["role"] == "student":
-    chosen = {"email": user.get("email","").strip(), "name": "", "student_no": ""}
-    st.caption(f"Active data source: **{MODE}** · Locked to: **{chosen['email']}**")
+def _gpa(s: pd.Series) -> float | None:
+    s = s.dropna()
+    if s.empty:
+        return None
+    return float(s.mean())
 
-elif user["role"] == "teacher":
-    t_email = user.get("email","").strip()
-    roster = roster_for_teacher(t_email)
-    if not roster:
-        st.warning("No enrollments found for your classes. Ask the registrar to populate the enrollments collection.")
-        st.stop()
-    labels = [f"{r['email'] or r['student_no']} — {r['name']}" for r in roster]
-    sel = st.selectbox("Select your student", labels, index=0)
-    r = roster[labels.index(sel)]
-    chosen = r
-    st.caption(f"Active data source: **{MODE}** · Teacher scope: **{t_email}**")
 
-else:  # registrar or admin
-    st.info("Registrar/Admin: choose a student to view the reports below.")
-    roster = roster_for_registrar_or_admin()
-    labels = [f"{r['email']} — {r['name']}" if r["email"] else (r["name"] or r["student_no"]) for r in roster]
-    sel = st.selectbox("Select student", labels, index=0 if labels else None, placeholder="email — name")
-    manual = st.text_input("…or enter email or name manually", value="")
-    if manual.strip():
-        m = manual.strip()
-        if "—" in m:  # clean pasted label
-            m = m.split("—", 1)[0].strip()
-        match = next((r for r in roster if r["email"] == m or r["name"] == m or r["student_no"] == m), None)
-        chosen = match or {"email": m if "@" in m else "", "name": "" if "@" in m else m, "student_no": ""}
+# ----------------------------
+# Page
+# ----------------------------
+
+def main():
+    # ---- Option A: single guard (no custom guard function) ----
+    user = require_role("student", "teacher", "registrar", "admin")
+    role = (user.get("role") or "").lower()
+
+    st.title("🎓 Student Dashboard")
+
+    # Determine scope: student sees self; others can pick a student.
+    df: pd.DataFrame
+
+    if role == "student":
+        target_email = (user.get("email") or "").strip().lower()
+        df = _load_enrollments_by_email(target_email)
+
+        # Soft fallback by name if email isn’t present in enrollments
+        if df.empty:
+            nm = user.get("name") or ""
+            alt = list(
+                col("enrollments").find(
+                    {"student.name": nm},
+                    {"student.email": 1, "student.student_no": 1},
+                    limit=1,
+                )
+            )
+            if alt:
+                sno = alt[0].get("student", {}).get("student_no")
+                if sno:
+                    df = _load_enrollments_by_studentno(sno)
+
+        st.caption("Scope: your enrollments")
     else:
-        chosen = roster[labels.index(sel)] if labels else {"email":"","name":"","student_no":""}
-    st.caption(f"Active data source: **{MODE}**")
+        choices = _list_students_for_picker()
+        if not choices:
+            st.info("No students found in enrollments.")
+            return
+        labels = [c[0] for c in choices]
+        picked = st.selectbox("View student", labels, index=0)
+        idx = labels.index(picked)
+        _label, student_no, email = choices[idx]
+        # Prefer email when available (usually more reliable after backfill)
+        df = _load_enrollments_by_email(email) if email else _load_enrollments_by_studentno(student_no)
+        st.caption(f"Scope: {picked}")
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Term helpers
-# ───────────────────────────────────────────────────────────────────────────────
-def semester_lookup():
-    lkp = {}
-    if has_collection("semesters") and nonempty_count("semesters"):
-        for s in col("semesters").find({}, {"_id":1,"school_year":1,"semester":1,"SchoolYear":1,"Semester":1,"label":1}).limit(100000):
-            sid = s.get("_id")
-            sy  = s.get("school_year") or s.get("SchoolYear")
-            sem = s.get("semester") or s.get("Semester")
-            label = s.get("label") or (f"{sy} S{sem}" if sy and sem else f"Sem {sid}")
-            lkp[sid] = label; lkp[str(sid)] = label
-    return lkp
+    if df.empty:
+        st.warning("No enrollments found.")
+        return
 
-SEM_LKP = semester_lookup()
+    # ----------------------------
+    # Filters
+    # ----------------------------
+    cols = st.columns(3)
+    with cols[0]:
+        terms = sorted(df["term_label"].dropna().unique(), key=_term_sort_key)
+        sel_terms = st.multiselect("Term(s)", options=terms, default=terms)
+    with cols[1]:
+        subjects = sorted(df["subject_code"].dropna().unique())
+        sel_subjects = st.multiselect("Subject(s)", options=subjects, default=subjects)
+    with cols[2]:
+        dept = sorted(df["program_code"].dropna().unique())
+        sel_prog = st.multiselect("Program(s)", options=dept, default=dept)
 
-def term_label(doc) -> str:
-    if MODE == "enrollments":
-        return f"{doc.get('term',{}).get('school_year','')} S{doc.get('term',{}).get('semester','')}".strip()
-    elif MODE == "grades":
-        sid = doc.get("SemesterID")
-        return SEM_LKP.get(sid) or SEM_LKP.get(str(sid)) or (f"Sem {sid}" if sid is not None else "")
+    if sel_terms:
+        df = df[df["term_label"].isin(sel_terms)]
+    if sel_subjects:
+        df = df[df["subject_code"].isin(sel_subjects)]
+    if sel_prog:
+        df = df[df["program_code"].isin(sel_prog)]
+
+    # ----------------------------
+    # Summary metrics
+    # ----------------------------
+    graded = df.dropna(subset=["grade"]).copy()
+    overall_gpa = _gpa(graded["grade"]) if not graded.empty else None
+
+    latest_term = None
+    if not graded.empty and not graded["term_label"].isna().all():
+        latest_term = (
+            sorted(graded["term_label"].dropna().unique(), key=_term_sort_key)[-1]
+            if graded["term_label"].dropna().size
+            else None
+        )
+    term_gpa = _gpa(graded[graded["term_label"] == latest_term]["grade"]) if latest_term else None
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Overall GPA", f"{overall_gpa:.2f}" if overall_gpa is not None else "—")
+    with m2:
+        st.metric("Latest Term", latest_term or "—")
+    with m3:
+        st.metric("Latest Term GPA", f"{term_gpa:.2f}" if term_gpa is not None else "—")
+
+    # ----------------------------
+    # 1) Term GPA trend
+    # ----------------------------
+    st.subheader("1) GPA Trend by Term")
+    if graded.empty:
+        st.info("No graded entries yet.")
     else:
-        return ""
+        g = (
+            graded.groupby("term_label", as_index=False)["grade"]
+            .mean()
+            .rename(columns={"grade": "gpa"})
+        )
+        g = g.sort_values(by="term_label", key=lambda s: s.map(_term_sort_key)).set_index("term_label")
+        st.line_chart(g)
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Build query keys based on MODE
-# ───────────────────────────────────────────────────────────────────────────────
-def candidate_keys(ch):
-    email = (ch.get("email") or "").strip().lower()
-    name  = (ch.get("name") or "").strip()
-    sno   = (ch.get("student_no") or "").strip()
-    if MODE == "enrollments":
-        return {"$or": [{"student.email": email}] if email else []} | \
-               {"$or": ([{"student.student_no": sno}] if sno else [])} | \
-               {"$or": ([{"student.name": name}] if name else [])}
-    elif MODE == "grades":
-        ors = []
-        if email: ors.append({"StudentID": email})
-        if sno:   ors.append({"StudentID": sno})
-        if name:  ors.append({"StudentID": name})
-        return {"$or": ors} if ors else {}
+    # ----------------------------
+    # 2) Transcript / Enrollments
+    # ----------------------------
+    st.subheader("2) Transcript")
+    show = df.copy()
+    show = show.sort_values(["term_label", "subject_code"], key=lambda s: s.map(_term_sort_key) if s.name == "term_label" else s)
+    show = show.rename(
+        columns={
+            "term_label": "Term",
+            "subject_code": "Subject",
+            "subject_title": "Title",
+            "units": "Units",
+            "grade": "Grade",
+            "remark": "Remark",
+            "teacher_name": "Teacher",
+        }
+    )
+    st.dataframe(
+        show[["Term", "Subject", "Title", "Units", "Grade", "Remark", "Teacher"]],
+        use_container_width=True,
+        height=min(520, 38 + 28 * len(show)),
+    )
+
+    # ----------------------------
+    # 3) Incomplete / Failed
+    # ----------------------------
+    st.subheader("3) Incomplete / Failed")
+    flags = df[(df["remark"].str.upper().eq("INC")) | (df["grade"].fillna(100) < 75)]
+    if flags.empty:
+        st.success("No incomplete or failed subjects in the selected scope.")
     else:
-        ors = []
-        if name:  ors.append({"StudentID": name})
-        if email: ors.append({"StudentID": email})
-        return {"$or": ors} if ors else {}
+        view = flags.copy().rename(columns={"term_label": "Term", "subject_code": "Subject", "subject_title": "Title"})
+        st.dataframe(view[["Term", "Subject", "Title", "Grade", "Remark"]], use_container_width=True)
 
-def find_terms_for_student():
-    q = candidate_keys(chosen)
-    if MODE == "enrollments" and q:
-        rows = col("enrollments").find(q, {"term.school_year":1,"term.semester":1}).limit(200000)
-        return sorted({f"{r.get('term',{}).get('school_year','')} S{r.get('term',{}).get('semester','')}" for r in rows})
-    elif MODE == "grades" and q:
-        rows = col("grades").find(q, {"SemesterID":1}).limit(200000)
-        return sorted({SEM_LKP.get(r.get("SemesterID")) or SEM_LKP.get(str(r.get("SemesterID"))) or f"Sem {r.get('SemesterID')}" for r in rows})
-    return []
+    # ----------------------------
+    # 4) Units Summary
+    # ----------------------------
+    st.subheader("4) Units Summary")
+    with_units = df.copy()
+    with_units["Units"] = pd.to_numeric(with_units["units"], errors="coerce")
+    sum_units = with_units.groupby("term_label", as_index=False)["Units"].sum().sort_values(
+        by="term_label", key=lambda s: s.map(_term_sort_key)
+    )
+    st.dataframe(sum_units.rename(columns={"term_label": "Term"}), use_container_width=True)
 
-with st.expander("Optional filters (Term)"):
-    terms = find_terms_for_student()
-    term_sel = st.multiselect("Filter by term(s)", terms, default=terms)
 
-def term_selected(doc) -> bool:
-    if not term_sel: return True
-    lbl = term_label(doc)
-    return lbl in term_sel if lbl else False
-
-# ───────────────────────────────────────────────────────────────────────────────
-# Load transcript
-# ───────────────────────────────────────────────────────────────────────────────
-def load_transcript_df():
-    q = candidate_keys(chosen)
-    if not q:
-        return pd.DataFrame(columns=["subject_code","semester","school_year","grade","remark"])
-
-    if MODE == "enrollments":
-        rows = list(col("enrollments").find(q, {"subject":1,"grade":1,"remark":1,"term":1}).limit(200000))
-        rows = [r for r in rows if term_selected(r)]
-        return pd.DataFrame([{
-            "subject_code": r.get("subject",{}).get("code",""),
-            "semester":     r.get("term",{}).get("semester",""),
-            "school_year":  r.get("term",{}).get("school_year",""),
-            "grade":        r.get("grade"),
-            "remark":       r.get("remark") or ("PASSED" if (r.get("grade") or 0) >= 75 else "FAILED")
-        } for r in rows])
-
-    elif MODE == "grades":
-        rows = list(col("grades").find(q, {"SubjectCodes":1,"Grades":1,"SemesterID":1}).limit(200000))
-        out = []
-        for r in rows:
-            lbl = term_label(r)
-            if term_sel and lbl not in term_sel: continue
-            codes = r.get("SubjectCodes") or []
-            grades = r.get("Grades") or []
-            for c, g in zip(codes, grades):
-                out.append({
-                    "subject_code": c, "semester": lbl.split(" S")[-1] if " S" in lbl else "",
-                    "school_year": lbl.split(" S")[0] if " S" in lbl else "",
-                    "grade": g, "remark": ("PASSED" if (g or 0) >= 75 else "FAILED") if g is not None else "INC"
-                })
-        return pd.DataFrame(out)
-
-    else:
-        rows = list(col("grades_ingested").find({"$or":[{"StudentID": chosen.get("name","")}, {"StudentID": chosen.get("email","")}]},
-                                                {"SubjectCode":1,"Grade":1,"Remark":1}).limit(200000))
-        return pd.DataFrame([{
-            "subject_code": r.get("SubjectCode",""),
-            "semester": "", "school_year": "",
-            "grade": r.get("Grade"),
-            "remark": r.get("Remark") or ("PASSED" if (r.get("Grade") or 0) >= 75 else "FAILED")
-        } for r in rows])
-
-def df_download_button(df, filename, label="Download CSV"):
-    st.download_button(label, df.to_csv(index=False).encode("utf-8"), filename, "text/csv")
-
-def fig_download_button(fig, filename, label="Download PNG"):
-    buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-    st.download_button(label, buf.getvalue(), filename, "image/png")
-
-df_all = load_transcript_df()
-if df_all.empty:
-    st.warning("No records found for this student (and term filter).")
-    st.stop()
-
-# 1) Transcript viewer
-st.subheader("1) Academic Transcript Viewer")
-st.dataframe(df_all.sort_values(["school_year","semester","subject_code"]), use_container_width=True, height=300)
-df_download_button(df_all, "student_transcript.csv")
-
-# 2) Performance Trend Over Time
-st.subheader("2) Performance Trend Over Time")
-tmp = df_all.dropna(subset=["grade"]).copy()
-tmp["term"] = tmp["school_year"].astype(str) + " S" + tmp["semester"].astype(str)
-trend = tmp.groupby("term", as_index=False)["grade"].mean().sort_values("term")
-if not trend.empty:
-    st.dataframe(trend, use_container_width=True)
-    fig2 = plt.figure(); plt.plot(trend["term"], trend["grade"], marker="o")
-    plt.xticks(rotation=45, ha="right"); plt.ylabel("Average Grade"); plt.title("Average Grade by Term")
-    st.pyplot(fig2); df_download_button(trend, "student_trend.csv"); fig_download_button(fig2, "student_trend.png")
-else:
-    st.info("Not enough data to plot a trend.")
-
-# 3) Subject Difficulty Ratings
-st.subheader("3) Subject Difficulty Ratings")
-df3 = df_all.copy(); df3["passed"] = df3["grade"].fillna(0) >= 75
-by_subj = df3.groupby("subject_code")["passed"].mean().reset_index().rename(columns={"passed":"my_pass_rate"})
-st.dataframe(by_subj.sort_values("my_pass_rate"), use_container_width=True)
-df_download_button(by_subj, "student_subject_difficulty.csv")
-
-# 4) Comparison with Class Average
-st.subheader("4) Comparison with Class Average")
-if MODE == "enrollments":
-    all_rows = list(col("enrollments").find({"grade":{"$exists": True}}, {"subject.code":1,"grade":1}).limit(500000))
-    df_all_class = pd.DataFrame([{"subject_code": r.get("subject",{}).get("code",""), "grade": r.get("grade")}
-                                 for r in all_rows if r.get("grade") is not None])
-elif MODE == "grades":
-    all_rows = list(col("grades").find({}, {"SubjectCodes":1,"Grades":1}).limit(200000))
-    pairs = []
-    for r in all_rows:
-        codes = r.get("SubjectCodes") or []
-        grades = r.get("Grades") or []
-        for c, g in zip(codes, grades):
-            if g is not None: pairs.append({"subject_code": c, "grade": g})
-    df_all_class = pd.DataFrame(pairs)
-else:
-    all_rows = list(col("grades_ingested").find({"Grade":{"$ne": None}}, {"SubjectCode":1,"Grade":1}).limit(500000))
-    df_all_class = pd.DataFrame([{"subject_code": r.get("SubjectCode",""), "grade": r.get("Grade")} for r in all_rows])
-
-my_avg = df_all.dropna(subset=["grade"]).groupby("subject_code")["grade"].mean().reset_index().rename(columns={"grade":"my_avg"})
-class_avg = df_all_class.groupby("subject_code")["grade"].mean().reset_index().rename(columns={"grade":"class_avg"})
-merged = pd.merge(my_avg, class_avg, on="subject_code", how="inner")
-if not merged.empty:
-    merged["delta"] = (merged["my_avg"] - merged["class_avg"]).round(2)
-    st.dataframe(merged.sort_values("delta"), use_container_width=True)
-    df_download_button(merged, "student_vs_class_avg.csv")
-else:
-    st.info("Not enough overlap to compare with class averages.")
-
-# 5) Passed vs Failed Summary
-st.subheader("5) Passed vs Failed Summary")
-counts = df_all["remark"].fillna("INC").value_counts().reindex(["PASSED","FAILED","INC"], fill_value=0)
-c1, c2 = st.columns(2)
-with c1: st.dataframe(counts.rename("count"))
-with c2:
-    fig5 = plt.figure(); plt.pie(counts.values, labels=counts.index, autopct="%1.1f%%"); st.pyplot(fig5)
-    fig_download_button(fig5, "student_pass_fail.png")
-
-# 6) Curriculum
-st.subheader("6) Curriculum and Subject Viewer")
-cur = None
-try: cur = col("curriculum").find_one({}, {"subjects":1})
-except Exception: cur = None
-if cur and isinstance(cur.get("subjects"), list):
-    all_codes = sorted({s.get("subjectCode") for s in cur["subjects"] if s.get("subjectCode")})
-    completed = set(df_all.loc[df_all["grade"].fillna(0) >= 75, "subject_code"])
-    remaining = [c for c in all_codes if c not in completed]
-    c1, c2 = st.columns(2)
-    with c1:
-        dfc = pd.DataFrame({"subject_code": sorted(list(completed))})
-        st.dataframe(dfc, use_container_width=True, height=250); df_download_button(dfc, "student_curriculum_completed.csv")
-    with c2:
-        dfr = pd.DataFrame({"subject_code": remaining})
-        st.dataframe(dfr, use_container_width=True, height=250); df_download_button(dfr, "student_curriculum_remaining.csv")
-else:
-    st.info("No curriculum data detected.")
+if __name__ == "__main__":
+    main()

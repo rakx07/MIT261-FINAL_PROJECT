@@ -4,6 +4,11 @@ import pandas as pd
 from utils import auth
 from utils.mongo_df import docs_to_df
 
+from utils.auth import require_role
+user = require_role("admin")
+
+
+
 st.set_page_config(page_title="Admin: Users", page_icon="🛠️", layout="wide")
 
 u = st.session_state.get("user")
