@@ -12,6 +12,9 @@ from db import col
 from utils.auth import require_role, current_user
 
 
+# ──────────────────────────────────────────
+# UI helpers
+# ──────────────────────────────────────────
 def _user_header(u: dict | None):
     if not u:
         return
@@ -34,10 +37,10 @@ def _user_header(u: dict | None):
         unsafe_allow_html=True,
     )
 
-# ──────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────
 
+# ──────────────────────────────────────────
+# Data helpers
+# ──────────────────────────────────────────
 def _term_label(sy: str | None, sem: int | None) -> str:
     if not sy:
         return "—"
@@ -49,7 +52,7 @@ def _term_label(sy: str | None, sem: int | None) -> str:
 
 
 def _term_sort_key(label: str) -> tuple[int, int]:
-    """Sort "2023-2024 S1", "2023-2024 S2", "2023-2024 S3" correctly."""
+    """Sort '2023-2024 S1', '2023-2024 S2', '2023-2024 S3' correctly."""
     if not isinstance(label, str) or " S" not in label:
         return (0, 0)
     sy, s = label.split(" S", 1)
@@ -80,10 +83,7 @@ def _nemail(e: str | None) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_term_catalog() -> list[tuple[str, str, int]]:
-    """
-    Read the full school-year/semester catalog (including Summer) from `semesters`.
-    Returns a sorted list of (label, school_year, semester).
-    """
+    """Read all school-years/semesters from `semesters`."""
     rows = list(col("semesters").find({}, {"school_year": 1, "semester": 1}))
     seen = set()
     out: list[tuple[str, str, int]] = []
@@ -101,9 +101,7 @@ def load_term_catalog() -> list[tuple[str, str, int]]:
 
 
 def list_teacher_emails() -> List[Tuple[str, str]]:
-    """
-    Returns [(name, email), ...] from enrollments.teacher.*.
-    """
+    """Returns [(name, email), ...] from enrollments.teacher.*."""
     pipe = [
         {"$match": {"teacher.email": {"$exists": True, "$ne": ""}}},
         {"$group": {"_id": "$teacher.email", "name": {"$first": "$teacher.name"}}},
@@ -177,7 +175,6 @@ def load_enrollments_df(teacher_email: Optional[str]) -> pd.DataFrame:
 # ──────────────────────────────────────────
 # Page
 # ──────────────────────────────────────────
-
 def main():
     # Auth — faculty, registrar, or admin
     user = require_role("faculty", "teacher", "registrar", "admin")
@@ -203,13 +200,14 @@ def main():
         else:
             st.info("No teacher emails found in enrollments; showing **all enrollments** instead.")
 
+    # Base data (already scoped by teacher)
     df = load_enrollments_df(teacher_email)
 
     # Global term catalog for the picker (always show all terms)
     term_catalog = load_term_catalog()
     all_term_labels = [lbl for (lbl, _, _) in term_catalog]
 
-    # Quick filters
+    # Quick filters (terms/subjects/programs)
     c1, c2, c3 = st.columns(3)
     with c1:
         sel_terms = st.multiselect("Term(s)", options=all_term_labels, default=all_term_labels)
@@ -227,17 +225,18 @@ def main():
     if sel_progs:
         df = df[df["program_code"].isin(sel_progs)]
 
+    # ─────────────────────────────────────
     # 1) Class Grade Distribution
+    # ─────────────────────────────────────
     st.subheader("1) Class Grade Distribution")
 
-    # Faculty Name field – show selected teacher if registrar/admin (FIX)
+    # Faculty Name — show selected teacher if registrar/admin
     faculty_display_name = user.get("name") or ""
     if role in ("registrar", "admin") and teacher_email:
         match = next((nm for nm, em in teachers if em == teacher_email), None)
         if match:
             faculty_display_name = match
 
-    # Header fields (like your sample)
     hc1, hc2 = st.columns([1, 1.4])
     with hc1:
         st.text_input("Faculty Name:", value=faculty_display_name, key="faculty_name_display")
@@ -252,7 +251,7 @@ def main():
     if graded.empty:
         st.info("No graded entries found for this scope.")
     else:
-        # ——— Build the subject-by-bin distribution table (percentages) ———
+        # Build subject-by-bin distribution table (percentages)
         bins = [0, 75, 80, 85, 90, 95, 100]
         labels = ["Below 75 (%)", "75–79 (%)", "80–84 (%)", "85–89 (%)", "90–94 (%)", "95–100 (%)"]
 
@@ -262,15 +261,13 @@ def main():
         tmp["bin"] = pd.cut(tmp["grade"], bins=bins, labels=labels, right=True, include_lowest=True)
 
         counts = (
-            tmp.groupby(["Course Code", "Course Name", "bin"], observed=False)  # silence FutureWarning
+            tmp.groupby(["Course Code", "Course Name", "bin"], observed=False)  # avoid FutureWarning
                .size()
                .unstack(fill_value=0)
         )
-
         for col in labels:
             if col not in counts.columns:
                 counts[col] = 0
-
         counts = counts[labels]
         totals = counts.sum(axis=1)
         pct = (counts.div(totals.replace(0, 1), axis=0) * 100).round(0).astype("Int64").astype(str) + "%"
@@ -285,13 +282,15 @@ def main():
 
         st.markdown("**Followed by: histogram**")
         hist_bins = list(range(60, 101, 5))
-        hist_counts = pd.cut(
-            graded["grade"], bins=hist_bins, right=True, include_lowest=True
-        ).value_counts().sort_index()
-        chart_df = pd.DataFrame({"Range": hist_counts.index.astype(str), "Count": hist_counts.values}).set_index("Range")
+        hist_counts = pd.cut(graded["grade"], bins=hist_bins, right=True, include_lowest=True)\
+                        .value_counts().sort_index()
+        chart_df = pd.DataFrame({"Range": hist_counts.index.astype(str), "Count": hist_counts.values})\
+                     .set_index("Range")
         st.bar_chart(chart_df)
 
-    # 2) Student Progress Tracker
+    # ─────────────────────────────────────
+    # 2) Student Progress Tracker (table → line chart)
+    # ─────────────────────────────────────
     st.subheader("2) Student Progress Tracker")
     st.caption("Shows longitudinal performance for individual students. Filtered by Subject or Course or YearLevel.")
 
@@ -299,10 +298,9 @@ def main():
         st.info("No data available for student progress.")
     else:
         g = graded.copy()
-        # GPA scale (0–4), like the screenshot
         g["gpa"] = (g["grade"].astype(float) / 100.0 * 4.0).clip(0, 4).round(2)
 
-        # pick terms for columns: prefer selected terms; else latest 3
+        # Choose columns (prefer selected terms; else last 3)
         terms_order = sel_terms if sel_terms else \
             sorted(g["term_label"].dropna().unique().tolist(), key=_term_sort_key)
         if len(terms_order) > 3:
@@ -310,15 +308,13 @@ def main():
 
         pivot = (
             g[g["term_label"].isin(terms_order)]
-            .groupby(["student_no", "student_name", "term_label"])["gpa"]
+            .groupby(["student_no", "student_name", "term_label"], observed=False)["gpa"]
             .mean()
             .reset_index()
-            .pivot_table(index=["student_no", "student_name"],
-                         columns="term_label", values="gpa", aggfunc="mean")
+            .pivot_table(index=["student_no", "student_name"], columns="term_label", values="gpa", aggfunc="mean")
             .reindex(columns=terms_order)
         )
 
-        # Trend like in image (↑ Improving / ↓ Needs Attention / → Stable High)
         def trend_text(row):
             vals = [v for v in row.tolist() if pd.notnull(v)]
             if len(vals) < 2:
@@ -346,19 +342,20 @@ def main():
         st.markdown("**Followed by: line graph / scatter chart.**")
         long_df = (
             pivot.reset_index()
-                 .melt(id_vars=["student_no", "student_name"],
-                       value_vars=terms_order, var_name="Term", value_name="GPA")
+                 .melt(id_vars=["student_no", "student_name"], value_vars=terms_order,
+                       var_name="Term", value_name="GPA")
                  .dropna(subset=["GPA"])
                  .sort_values(["student_no", "Term"])
         )
         chart_wide = (
-            long_df.pivot_table(index="Term", columns="student_name",
-                                values="GPA", aggfunc="mean")
+            long_df.pivot_table(index="Term", columns="student_name", values="GPA", aggfunc="mean")
                    .reindex(terms_order)
         )
         st.line_chart(chart_wide)
 
+    # ─────────────────────────────────────
     # 3) Subject Difficulty Heatmap (Fail %)
+    # ─────────────────────────────────────
     st.subheader("3) Subject Difficulty Heatmap (Fail %)")
     if graded.empty:
         st.info("No data for fail rates.")
@@ -375,7 +372,9 @@ def main():
         else:
             st.dataframe(fail.sort_values("fail_rate_%", ascending=False), use_container_width=True)
 
-    # 4) Intervention (latest term)
+    # ─────────────────────────────────────
+    # 4) Intervention Candidates (latest term)
+    # ─────────────────────────────────────
     st.subheader("4) Intervention Candidates")
     if graded.empty:
         st.info("No graded entries.")
@@ -401,7 +400,9 @@ def main():
             )
             st.dataframe(show, use_container_width=True, height=min(520, 35 + 28 * len(show)))
 
+    # ─────────────────────────────────────
     # 5) Grade Submission Status
+    # ─────────────────────────────────────
     st.subheader("5) Grade Submission Status")
     if df.empty:
         st.info("No enrollments to summarize.")
@@ -425,7 +426,9 @@ def main():
         )
         st.dataframe(status, use_container_width=True)
 
+    # ─────────────────────────────────────
     # 6) Custom Query Builder
+    # ─────────────────────────────────────
     st.subheader("6) Custom Query Builder")
     st.caption("Allows users to build filtered queries (e.g., “Show all students with < 75 in CS101”).")
 
@@ -463,7 +466,7 @@ def main():
 
         run_query = st.button("Run Query", type="primary", key="cq_run")
 
-        # Pretty example line
+        # Example line
         if cq_subject != "(any)":
             if cq_op == "between" and cq_val2 is not None:
                 example_txt = f"Show all students with {cq_val1:.0f} ≤ grade ≤ {cq_val2:.0f} in {cq_subject}"
@@ -520,6 +523,94 @@ def main():
 
                 st.dataframe(res, use_container_width=True, hide_index=True)
                 st.caption(f"{len(res)} result(s)")
+
+    # ─────────────────────────────────────
+    # 7) Students Grade Analytics (Per Teacher)
+    # ─────────────────────────────────────
+    st.subheader("7) Students Grade Analytics (Per Teacher)")
+
+    _all_teachers = teachers or list_teacher_emails()
+    if not _all_teachers:
+        st.info("No teachers found.")
+    else:
+        labels = [f"{nm}" for nm, _em in _all_teachers]
+        emails = [em for _nm, em in _all_teachers]
+        default_idx = 0
+        if teacher_email in emails:
+            default_idx = emails.index(teacher_email)
+
+        sel_teacher_name = st.selectbox("Select Teacher", options=labels, index=default_idx, key="gpt_tch_sel")
+        sel_teacher_email = emails[labels.index(sel_teacher_name)]
+
+        df_t = load_enrollments_df(sel_teacher_email)
+
+        if df_t.empty:
+            st.info("No enrollments for the selected teacher.")
+        else:
+            subj_labels = (
+                df_t.assign(_label=lambda d: d["subject_code"].fillna("").astype(str) + " - " +
+                                      d["subject_title"].fillna("").astype(str))
+                   .drop_duplicates(subset=["subject_code"])
+                   .sort_values("subject_code")
+            )
+            subj_options = subj_labels["_label"].tolist()
+            label_to_code = dict(zip(subj_labels["_label"], subj_labels["subject_code"]))
+
+            sel_subj_label = st.selectbox("Select Subject:", options=subj_options, key="gpt_subj_sel")
+            sel_subj_code = label_to_code.get(sel_subj_label)
+
+            df_s = df_t[df_t["subject_code"] == sel_subj_code].copy()
+            df_s = df_s.dropna(subset=["grade"])
+            st.markdown(f"**Grades Summary of Faculty: {sel_teacher_name}**")
+
+            if df_s.empty:
+                st.info("No graded entries for this subject.")
+            else:
+                g = df_s["grade"].astype(float)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Mean", f"{g.mean():.2f}")
+                c2.metric("Median", f"{g.median():.2f}")
+                c3.metric("Highest", f"{g.max():.2f}")
+                c4.metric("Lowest", f"{g.min():.2f}")
+
+                st.markdown(f"**Grade Distribution – {sel_subj_label}**")
+                bins = list(range(60, 101, 5))
+                hist = pd.cut(g, bins=bins, right=True, include_lowest=True).value_counts().sort_index()
+                hist_df = pd.DataFrame({"Range": hist.index.astype(str), "Frequency": hist.values}).set_index("Range")
+                st.bar_chart(hist_df)
+
+                st.markdown("**Pass vs Fail**")
+                pass_threshold = 75.0
+                pass_cnt = int((g >= pass_threshold).sum())
+                fail_cnt = int((g < pass_threshold).sum())
+                pvf_df = pd.DataFrame({"Outcome": ["Pass", "Fail"], "Count": [pass_cnt, fail_cnt]}).set_index("Outcome")
+                st.bar_chart(pvf_df)
+
+                table_cols = {
+                    "student_no": "Student ID",
+                    "student_name": "Student Name",
+                    "program_code": "Course",
+                    "grade": "Grade",
+                }
+                if "year_level" in df_s.columns:
+                    df_s["_YearLevel"] = df_s["year_level"]
+                elif "yearlevel" in df_s.columns:
+                    df_s["_YearLevel"] = df_s["yearlevel"]
+                else:
+                    df_s["_YearLevel"] = ""
+
+                out = (
+                    df_s.assign(_pass_fail=lambda d: np.where(d["grade"].astype(float) >= pass_threshold, "Pass", "Fail"))
+                        .rename(columns=table_cols)
+                )
+                cols_to_show = ["Student ID", "Student Name", "Course", "_YearLevel", "Grade", "_pass_fail"]
+                cols_to_show = [c for c in cols_to_show if c in out.columns]
+                out = out[cols_to_show].rename(columns={"_YearLevel": "YearLevel", "_pass_fail": "Pass/Fail"})
+                out = out.sort_values(["Pass/Fail", "Student Name"], ascending=[True, True], na_position="last")
+
+                st.markdown("**Student Grades**")
+                st.dataframe(out, use_container_width=True, hide_index=True)
+
 
 if __name__ == "__main__":
     main()
