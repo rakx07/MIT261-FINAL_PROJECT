@@ -14,6 +14,7 @@ user = require_role("registrar", "admin")   # only registrar/admin may open
 # -----------------------------
 # Small helpers (robust parsing)
 # -----------------------------
+from utils.auth import require_role, render_logout_sidebar  # add this import
 
 def _safe_str(x) -> str:
     try:

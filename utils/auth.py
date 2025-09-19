@@ -195,3 +195,43 @@ def require_role(*roles: str) -> dict:
     if roles and u.get("role") not in roles:
         st.error("You are not authorized to view this page."); st.stop()
     return u
+# --- Sidebar footer with user + logout (reusable on any page) ---
+def render_logout_sidebar() -> None:
+    """Show a user badge + Log out button in the sidebar (only when signed in)."""
+    u = current_user()
+    if not u:
+        return
+
+    # one-time CSS (kept minimal and matches the app's style)
+    if not st.session_state.get("_sb_css_injected"):
+        st.markdown(
+            """
+            <style>
+              .sb-footer { border-top:1px solid rgba(255,255,255,.08); padding:.85rem .8rem 1rem .8rem; }
+              .sb-user { display:flex; align-items:center; gap:.6rem; margin-bottom:.55rem; }
+              .sb-user .badge { font-weight:700; font-size:.75rem; padding:.10rem .4rem;
+                                background:#243042; color:#dfe7ff; border-radius:.35rem;
+                                border:1px solid rgba(255,255,255,.06); }
+              .sb-user .email { color:#cfd6e6; font-size:.87rem; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.session_state["_sb_css_injected"] = True
+
+    with st.sidebar:
+        st.markdown('<div class="sb-footer">', unsafe_allow_html=True)
+        st.markdown(
+            f"""<div class="sb-user">
+                   <div class="badge">{(u.get("role") or "").upper()}</div>
+                   <div class="email">{u.get("email","")}</div>
+                 </div>""",
+            unsafe_allow_html=True,
+        )
+        if st.button("Log out", type="secondary", use_container_width=True, key="sb_logout"):
+            sign_out()
+            # Cross-version rerun (Streamlit 1.30+: st.rerun; older: st.experimental_rerun)
+            r = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+            if callable(r):
+                r()
+        st.markdown("</div>", unsafe_allow_html=True)

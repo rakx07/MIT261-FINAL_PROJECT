@@ -15,6 +15,7 @@ user = require_role("teacher", "registrar", "admin")
 # ──────────────────────────────────────────────────────────────────────────────
 # Small helpers
 # ──────────────────────────────────────────────────────────────────────────────
+from utils.auth import require_role, render_logout_sidebar  # add this import
 
 def _term_label(sy: str | None, sem: int | None) -> str:
     if not sy:

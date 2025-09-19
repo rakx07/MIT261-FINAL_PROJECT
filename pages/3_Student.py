@@ -15,8 +15,10 @@ from utils.auth import get_current_user, require_role
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+from utils.auth import require_role, render_logout_sidebar  # add this import
 
 PASSING_GRADE = 75  # align with your app-wide rule
+
 
 def _term_label(sy: str | None, sem: int | None) -> str:
     if not sy:
@@ -26,6 +28,7 @@ def _term_label(sy: str | None, sem: int | None) -> str:
     except Exception:
         s = 0
     return f"{sy} S{s}" if s else sy
+
 
 def _term_sort_key(label: str) -> tuple[int, int]:
     if not isinstance(label, str) or " S" not in label:
@@ -41,6 +44,7 @@ def _term_sort_key(label: str) -> tuple[int, int]:
         sem = 0
     return (start_year, sem)
 
+
 def _to_num_grade(x) -> float | None:
     try:
         v = float(x)
@@ -49,6 +53,7 @@ def _to_num_grade(x) -> float | None:
         return v
     except Exception:
         return None
+
 
 def _cumulative_gpa(df: pd.DataFrame) -> Optional[float]:
     """Units-weighted GPA across all rows with numeric grade + positive units."""
@@ -61,6 +66,7 @@ def _cumulative_gpa(df: pd.DataFrame) -> Optional[float]:
         return None
     return round(float((g[mask] * u[mask]).sum() / u[mask].sum()), 2)
 
+
 def _semester_gpa(block: pd.DataFrame) -> Optional[float]:
     if block.empty:
         return None
@@ -71,12 +77,40 @@ def _semester_gpa(block: pd.DataFrame) -> Optional[float]:
         return None
     return round(float((g[mask] * u[mask]).sum() / u[mask].sum()), 2)
 
+
 def _grade_buckets(df: pd.DataFrame) -> Dict[str, int]:
     g = pd.to_numeric(df["grade"], errors="coerce")
     passed = int((g >= PASSING_GRADE).sum())
     failed = int((g.notna() & (g < PASSING_GRADE)).sum())
     incomplete = int(g.isna().sum())
     return {"Passed": passed, "Failed": failed, "In-Progress": incomplete}
+
+
+# ------------------------------------------------------------------
+# DB helpers
+# ------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def _subject_units_map(codes: List[str]) -> Dict[str, int]:
+    """
+    Build {subject_code -> units} from the 'subjects' collection
+    (fallback when enrollments.subject.units is missing).
+    """
+    if not codes:
+        return {}
+    q = {"_id": {"$in": list(set([c for c in codes if c]))}}
+    proj = {"Units": 1}
+    out: Dict[str, int] = {}
+    for d in col("subjects").find(q, proj):
+        code = d.get("_id")
+        units = d.get("Units", 0)
+        if code:
+            try:
+                out[code] = int(units or 0)
+            except Exception:
+                out[code] = 0
+    return out
+
 
 # ------------------------------------------------------------------
 # Data loading
@@ -100,7 +134,6 @@ def load_student_enrollments(
     proj = {
         "grade": 1,
         "remark": 1,
-        "units": {"$ifNull": ["$subject.units", 0]},
         "term.school_year": 1,
         "term.semester": 1,
         "student.name": 1,
@@ -108,7 +141,10 @@ def load_student_enrollments(
         "student.email": 1,
         "subject.code": 1,
         "subject.title": 1,
+        "subject.units": 1,             # may be missing -> we'll fallback
         "program.program_code": 1,
+        "offering.section": 1,          # preferred place for section
+        "section": 1,                    # fallback if some docs keep it at root
     }
 
     rows = list(col("enrollments").find(q, proj))
@@ -116,7 +152,7 @@ def load_student_enrollments(
         return pd.DataFrame(columns=[
             "student_no", "student_email", "student_name",
             "subject_code", "subject_title", "program_code",
-            "term_label", "grade", "remark", "units"
+            "term_label", "grade", "remark", "units", "section"
         ])
 
     def flat(e):
@@ -124,6 +160,7 @@ def load_student_enrollments(
         stu = e.get("student") or {}
         sub = e.get("subject") or {}
         prog = e.get("program") or {}
+        section = (e.get("offering") or {}).get("section") or e.get("section")
         return {
             "student_no": stu.get("student_no"),
             "student_email": (stu.get("email") or "").strip().lower(),
@@ -134,12 +171,22 @@ def load_student_enrollments(
             "term_label": _term_label(term.get("school_year"), term.get("semester")),
             "grade": _to_num_grade(e.get("grade")),
             "remark": e.get("remark"),
-            "units": sub.get("units", 0) or 0,
+            "units": sub.get("units", None),  # finalize below with subjects fallback
             "sy": term.get("school_year"),
             "sem": term.get("semester"),
+            "section": section,
         }
 
     df = pd.DataFrame([flat(r) for r in rows])
+
+    # fill missing/zero units from 'subjects' collection
+    missing = df["units"].isna() | (pd.to_numeric(df["units"], errors="coerce").fillna(0) == 0)
+    if missing.any():
+        codes = df.loc[missing, "subject_code"].dropna().unique().tolist()
+        umap = _subject_units_map(codes)
+        df.loc[missing, "units"] = df.loc[missing, "subject_code"].map(lambda c: umap.get(c, 0))
+    df["units"] = pd.to_numeric(df["units"], errors="coerce").fillna(0).astype(int)
+
     # stable order
     df["term_key"] = df["term_label"].map(_term_sort_key)
     df = df.sort_values(["term_key", "subject_code"]).reset_index(drop=True)
@@ -194,7 +241,7 @@ def load_cohort_stats(codes: List[str], sys: List[str], sems: List[int]) -> pd.D
 
 
 # ------------------------------------------------------------------
-# Prospectus / PDF (logic based on your evaluation page)
+# Prospectus / PDF (same logic as your evaluation page)
 # ------------------------------------------------------------------
 
 def _prospectus_summary(df: pd.DataFrame) -> Dict[str, Any]:
@@ -211,9 +258,10 @@ def _prospectus_summary(df: pd.DataFrame) -> Dict[str, Any]:
     return dict(overall_gpa=overall, total_units_earned=earned,
                 passed_cnt=int(passed), failed_cnt=int(failed), inprog_cnt=int(inprog))
 
-def _build_pdf(student: Dict[str, Any], per_sem: Dict[str, pd.DataFrame], gpa_points: List[Tuple[str, float]], summary: Dict[str, Any]) -> bytes:
+
+def _build_pdf(student: Dict[str, Any], per_sem: Dict[str, pd.DataFrame],
+               gpa_points: List[Tuple[str, float]], summary: Dict[str, Any]) -> bytes:
     # light-weight table PDF using ReportLab (optional dependency).
-    # If ReportLab isn't available in your venv, skip rendering the button.
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib import colors
@@ -296,6 +344,53 @@ def _build_pdf(student: Dict[str, Any], per_sem: Dict[str, pd.DataFrame], gpa_po
 
 
 # ------------------------------------------------------------------
+# Optional student finder (Registrar/Admin)
+# ------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def _search_candidates(keyword: str, limit: int = 50) -> List[Dict[str, str]]:
+    """
+    Returns [{student_no, email, name}] from 'students' (preferred) and
+    falls back to 'users' with role='student' if needed.
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        return []
+    # exact email or student no match first
+    students = col("students")
+    hits = list(students.find(
+        {"$or": [
+            {"email": kw},
+            {"student_no": kw},
+            {"name": {"$regex": kw, "$options": "i"}}
+        ]},
+        {"student_no": 1, "email": 1, "name": 1}
+    ).limit(limit))
+
+    if not hits:
+        # fallback to users collection
+        users = col("users")
+        hits = list(users.find(
+            {"role": "student", "$or": [
+                {"email": kw},
+                {"name": {"$regex": kw, "$options": "i"}}
+            ]},
+            {"email": 1, "name": 1}
+        ).limit(limit))
+        # shape to student-like objects
+        shaped = []
+        for u in hits:
+            shaped.append({"student_no": None, "email": u.get("email"), "name": u.get("name")})
+        return shaped
+
+    # normalize shape
+    shaped = []
+    for s in hits:
+        shaped.append({"student_no": s.get("student_no"), "email": s.get("email"), "name": s.get("name")})
+    return shaped
+
+
+# ------------------------------------------------------------------
 # UI / Page
 # ------------------------------------------------------------------
 
@@ -313,20 +408,41 @@ def main():
         student_email = (user.get("email") or "").strip().lower()
         st.caption(f"Signed in as **{user.get('email','')}**. Showing your records.")
     else:
-        st.caption("Registrar/Admin: search a student by email or ID.")
-        c1, c2, c3 = st.columns([2, 1, 1])
+        st.caption("Registrar/Admin: search a student by email, student no., or name keyword.")
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
         with c1:
-            student_email = st.text_input("Student email (preferred)", value="")
+            kw = st.text_input("Find by email / student no. / name", value="")
         with c2:
-            student_no = st.text_input("Student No.", value="")
+            if st.button("Search"):
+                st.session_state["_candidates"] = _search_candidates(kw, limit=50)
         with c3:
-            st.write("")  # spacer
-            go = st.button("Load")
+            # candidate picker
+            cand = st.selectbox(
+                "Matches",
+                options=[f"{c.get('name','')} ({c.get('student_no') or '—'}) · {c.get('email','')}"
+                         for c in st.session_state.get("_candidates", [])] or ["—"],
+                index=0
+            )
+        with c4:
+            load_btn = st.button("Load")
+
+        # derive selection
+        if st.session_state.get("_candidates") and cand != "—":
+            idx = [f"{c.get('name','')} ({c.get('student_no') or '—'}) · {c.get('email','')}"
+                   for c in st.session_state["_candidates"]].index(cand)
+            choice = st.session_state["_candidates"][idx]
+            student_email = (choice.get("email") or "").strip().lower()
+            student_no = choice.get("student_no")
+        elif kw and "@" in kw:
+            student_email = kw.strip().lower()
+        elif kw:
+            student_no = kw.strip()
+
         if not (student_email or student_no):
-            st.info("Enter a student email or student number to load the dashboard.")
+            st.info("Search and pick a student to load the dashboard.")
             if not st.session_state.get("_loaded_any_student"):
                 return
-        else:
+        elif load_btn:
             st.session_state["_loaded_any_student"] = True
 
     # -------------------- load records --------------------
@@ -335,11 +451,24 @@ def main():
         st.warning("No enrollments found for this student.")
         return
 
-    # filters (terms)
-    term_opts = df["term_label"].dropna().unique().tolist()
-    term_opts = sorted(term_opts, key=_term_sort_key)
-    sel_terms = st.multiselect("Term(s)", options=term_opts, default=term_opts)
-    df = df[df["term_label"].isin(sel_terms)].copy()
+    # -------------------- filters: terms / sections / subjects --------------------
+    fcols = st.columns(3)
+    with fcols[0]:
+        term_opts = sorted(df["term_label"].dropna().unique().tolist(), key=_term_sort_key)
+        sel_terms = st.multiselect("Term(s)", options=term_opts, default=term_opts)
+    with fcols[1]:
+        section_opts = sorted([s for s in df["section"].dropna().unique().tolist() if s not in (None, "", "—")])
+        sel_sections = st.multiselect("Section(s)", options=section_opts, default=section_opts)
+    with fcols[2]:
+        subj_opts = sorted(df["subject_code"].dropna().unique().tolist())
+        sel_subjects = st.multiselect("Subject(s)", options=subj_opts, default=subj_opts)
+
+    if sel_terms:
+        df = df[df["term_label"].isin(sel_terms)].copy()
+    if sel_sections:
+        df = df[df["section"].isin(sel_sections)].copy()
+    if sel_subjects:
+        df = df[df["subject_code"].isin(sel_subjects)].copy()
 
     # header metrics
     c1, c2, c3, c4 = st.columns(4)
@@ -358,8 +487,14 @@ def main():
         gpa = _semester_gpa(block)
         total_units = int(pd.to_numeric(block["units"], errors="coerce").fillna(0).sum())
         with st.expander(f"{sem}  ·  GPA: {gpa if gpa is not None else '—'}  ·  Units: {total_units}", expanded=True):
-            show = block[["subject_code", "subject_title", "units", "grade", "remark"]].rename(
-                columns={"subject_code": "Subject", "subject_title": "Description"}
+            show = block[["subject_code", "subject_title", "units", "grade", "remark", "section"]].rename(
+                columns={
+                    "subject_code": "Subject",
+                    "subject_title": "Description",
+                    "units": "Units",
+                    "grade": "Final Grade",
+                    "section": "Section",
+                }
             )
             st.dataframe(show, use_container_width=True, hide_index=True)
 
@@ -383,7 +518,6 @@ def main():
     # 3) Subject Difficulty Ratings (fail-rate derived)
     # ------------------------------------------------------------------
     st.subheader("3) Subject Difficulty Ratings")
-    # Load cohort statistics once for all the student's picked terms/subjects
     cohort = load_cohort_stats(
         codes=df["subject_code"].dropna().unique().tolist(),
         sys=df["sy"].dropna().unique().tolist(),
@@ -398,7 +532,7 @@ def main():
             on=["subject_code", "term_label"],
             how="left",
         )
-        # Simple 1–5 rating based on fail-rate bands
+
         def _rate(fr):
             if pd.isna(fr): return None
             if fr >= 60: return 5
@@ -424,14 +558,12 @@ def main():
     if df.empty:
         st.info("No data to compare.")
     else:
-        subj_opts = sorted(df["subject_code"].dropna().unique())
-        pick_subj = st.selectbox("Subject", options=subj_opts)
-        # compute student's per-term grade for that subject
+        subj_opts2 = sorted(df["subject_code"].dropna().unique())
+        pick_subj = st.selectbox("Subject", options=subj_opts2)
         me = df[df["subject_code"] == pick_subj][["term_label", "grade"]].copy()
         me = me.groupby("term_label", as_index=False)["grade"].mean()
         me = me.sort_values("term_label", key=lambda s: s.map(_term_sort_key))
 
-        # cohort avg for that subject
         csub = cohort[cohort["subject_code"] == pick_subj][["term_label", "class_avg"]].copy()
         csub = csub.sort_values("term_label", key=lambda s: s.map(_term_sort_key))
 
@@ -453,10 +585,9 @@ def main():
     st.bar_chart(part_df)
 
     # ------------------------------------------------------------------
-    # 6) Curriculum / Prospectus (inline, based on your evaluation page)
+    # 6) Curriculum / Prospectus
     # ------------------------------------------------------------------
     st.subheader("6) Curriculum / Prospectus")
-    # Per-term blocks for current filter
     per_sem: Dict[str, pd.DataFrame] = {}
     gpa_pts: List[Tuple[str, float]] = []
     for sem in sorted(df["term_label"].unique(), key=_term_sort_key):
@@ -464,7 +595,6 @@ def main():
         per_sem[sem] = block
         gpa_pts.append((sem, _semester_gpa(block)))
 
-    # summary + viewer
     summary = _prospectus_summary(df)
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Overall GPA", summary["overall_gpa"] if summary["overall_gpa"] is not None else "—")
@@ -484,7 +614,6 @@ def main():
                 use_container_width=True, hide_index=True
             )
 
-    # PDF (uses small inline builder; your full page keeps its richer version)
     student_stub = {
         "student_name": df["student_name"].iloc[0],
         "student_no": df["student_no"].iloc[0],
@@ -502,6 +631,7 @@ def main():
         "Prospectus logic is aligned with the dedicated evaluation page "
         "(tables, per-term GPAs, summary, and a PDF export are built the same way)."
     )
+
 
 if __name__ == "__main__":
     main()
