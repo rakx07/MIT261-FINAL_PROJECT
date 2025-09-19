@@ -98,10 +98,9 @@ def load_enrollments_df(
     """
     Pulls enrollments and returns a tidy DataFrame with robust types:
       columns: student_no, student_name, program, subject_code, subject_title,
-      department, grade, teacher_name, teacher_email, term_label, school_year, semester, section
+      department, grade (numeric), raw_grade (original), remark, teacher_name, teacher_email,
+      term_label, school_year, semester, section
     """
-
-    # Project only what we need for speed
     fields = {
         "_id": 0,
         "student.student_no": 1,
@@ -110,8 +109,9 @@ def load_enrollments_df(
         "program.program_name": 1,
         "subject.code": 1,
         "subject.title": 1,
-        "subject.department": 1,     # if not present in docs it's fine (becomes NaN)
-        "grade": 1,
+        "subject.department": 1,
+        "grade": 1,                # original grade text/number
+        "remark": 1,               # INC/DROPPED/etc
         "teacher.name": 1,
         "teacher.email": 1,
         "term.school_year": 1,
@@ -119,7 +119,6 @@ def load_enrollments_df(
         "section": 1,
     }
 
-    # Build a naive filter for terms if provided (OR over each term)
     mongo_filter = {}
     if selected_terms:
         ors = []
@@ -132,28 +131,15 @@ def load_enrollments_df(
 
     rows = list(col("enrollments").find(mongo_filter, fields))
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "student_no",
-                "student_name",
-                "program",
-                "subject_code",
-                "subject_title",
-                "department",
-                "grade",
-                "teacher_name",
-                "teacher_email",
-                "term_label",
-                "school_year",
-                "semester",
-                "section",
-            ]
-        )
+        return pd.DataFrame(columns=[
+            "student_no","student_name","program",
+            "subject_code","subject_title","department",
+            "grade","raw_grade","remark",
+            "teacher_name","teacher_email",
+            "term_label","school_year","semester","section"
+        ])
 
-    df = pd.json_normalize(rows)
-
-    # Rename/shape columns
-    ren = {
+    df = pd.json_normalize(rows).rename(columns={
         "student.student_no": "student_no",
         "student.name": "student_name",
         "program.program_code": "program_code",
@@ -165,21 +151,18 @@ def load_enrollments_df(
         "teacher.email": "teacher_email",
         "term.school_year": "school_year",
         "term.semester": "semester",
-    }
-    df = df.rename(columns=ren)
+    })
 
-    # Program display string
-    df["program"] = df.apply(
-        lambda r: r.get("program_name") or r.get("program_code") or "(Unknown)",
-        axis=1,
-    )
+    # Display program
+    df["program"] = df.apply(lambda r: r.get("program_name") or r.get("program_code") or "(Unknown)", axis=1)
 
-    # Build term_label
+    # Term label
     df["term_label"] = df.apply(lambda r: _term_label(r.get("school_year"), r.get("semester")), axis=1)
 
-    # Grade cleanup
-    df["grade"] = pd.to_numeric(df["grade"], errors="coerce")
-    df = df.dropna(subset=["grade"]).copy()
+    # Keep original grade text and also a numeric version
+    df["raw_grade"] = df.get("grade")
+    df["grade"] = pd.to_numeric(df["raw_grade"], errors="coerce")  # numeric, may be NaN for INC/etc
+    # IMPORTANT: do NOT drop NaNs — we need them for INC/DROPPED reports
 
     # Optional filters
     subj_re = _to_regex(subject_regex_str)
@@ -197,28 +180,18 @@ def load_enrollments_df(
             key=lambda s: _sort_key_for_series_of_term_labels(s) if s.name == "term_label" else s,
         )
 
-    # Final column order
+    # Final column order (include remark & raw_grade for later reports)
     wanted = [
-        "student_no",
-        "student_name",
-        "program",
-        "subject_code",
-        "subject_title",
-        "department",
-        "grade",
-        "teacher_name",
-        "teacher_email",
-        "term_label",
-        "school_year",
-        "semester",
-        "section",
+        "student_no","student_name","program",
+        "subject_code","subject_title","department",
+        "grade","raw_grade","remark",
+        "teacher_name","teacher_email",
+        "term_label","school_year","semester","section",
     ]
     for c in wanted:
         if c not in df.columns:
             df[c] = np.nan
-    df = df[wanted]
-
-    return df
+    return df[wanted]
 
 
 # -----------------------------
@@ -303,22 +276,43 @@ def render_probation(df: pd.DataFrame, max_gpa: float):
     st.dataframe(per, use_container_width=True)
 
 
-def render_subject_pass_fail(df: pd.DataFrame):
-    st.subheader("Subject Pass/Fail Distribution")
+def render_incomplete_grades(df: pd.DataFrame):
+    st.subheader("Incomplete Grades Report")
+
     if df.empty:
         _empty_state("No rows for the current filters.")
-    # simple rule: pass >= 75
-    pass_mask = df["grade"].astype(float) >= 75
-    out = (
-        df.assign(result=np.where(pass_mask, "Pass", "Fail"))
-        .groupby(["term_label", "subject_code", "result"], as_index=False)
-        .size()
-        .pivot(index=["term_label", "subject_code"], columns="result", values="size")
-        .fillna(0)
-        .reset_index()
-        .sort_values(by="term_label", key=_sort_key_for_series_of_term_labels)
+
+    # Treat these as incomplete/dropped statuses
+    INC_STAT = {"INC", "INCOMPLETE", "INCOMP"}
+    DRP_STAT = {"DROP", "DROPPED", "DRP", "WITHDRAWN", "WD", "W"}
+
+    remark = df.get("remark", pd.Series(dtype=object)).astype(str).str.upper()
+    raw = df.get("raw_grade", pd.Series(dtype=object)).astype(str).str.upper()
+
+    mask_inc = remark.isin(INC_STAT) | raw.isin(INC_STAT)
+    mask_drp = remark.isin(DRP_STAT) | raw.isin(DRP_STAT)
+    incomplete = df[mask_inc | mask_drp].copy()
+
+    if incomplete.empty:
+        st.success("No INC or DROPPED grades in the current scope.")
+        return
+
+    # Friendly columns
+    show = incomplete[[
+        "term_label","school_year","semester",
+        "subject_code","subject_title",
+        "student_no","student_name",
+        "raw_grade","remark",
+        "teacher_name","section","department"
+    ]].rename(columns={
+        "raw_grade": "grade_text"
+    }).sort_values(
+        by=["term_label","subject_code","student_name"],
+        key=lambda s: _sort_key_for_series_of_term_labels(s) if s.name == "term_label" else s
     )
-    st.dataframe(out, use_container_width=True)
+
+    st.caption("Rows where grade/remark indicates INC or DROPPED.")
+    st.dataframe(show, use_container_width=True, height=min(600, 38 + 28 * len(show)))
 
 
 def render_enrollment_analysis(df: pd.DataFrame):
@@ -331,12 +325,6 @@ def render_enrollment_analysis(df: pd.DataFrame):
         .sort_values(by="term_label", key=_sort_key_for_series_of_term_labels)
     )
     st.dataframe(g, use_container_width=True)
-
-
-def render_incomplete_grades(df: pd.DataFrame):
-    st.subheader("Incomplete Grades Report")
-    # In this dataset, INC grades were either absent or non-numeric; we already coerced & dropped non-numeric.
-    st.info("No 'INC' rows appear after cleaning. (We drop non-numeric 'grade' values by design.)")
 
 
 def render_retention_dropout(df: pd.DataFrame):
@@ -388,6 +376,7 @@ def render_top_performers_per_program(df: pd.DataFrame, topn: int = 10):
 # -----------------------------
 
 def render_failed_students_by_subject(df: pd.DataFrame, passing: float = 75.0) -> None:
+    """Show students who failed per subject. Backfills missing names from df and DB."""
     st.subheader("Failed Students (by Subject)")
     st.caption("Includes teacher, section, and term info based on current filters.")
     if df.empty:
@@ -401,6 +390,50 @@ def render_failed_students_by_subject(df: pd.DataFrame, passing: float = 75.0) -
         st.success("No failing records in the current scope.")
         return
 
+    # --- Back-fill missing student_name ---
+
+    # 1) Use any names that already exist in the (filtered) dataframe
+    if {"student_no", "student_name"}.issubset(d.columns):
+        names_from_df = (
+            d[["student_no", "student_name"]]
+            .dropna()
+            .drop_duplicates()
+            .set_index("student_no")["student_name"]
+        )
+        fails["student_name"] = fails["student_name"].fillna(
+            fails["student_no"].map(names_from_df)
+        )
+
+    # 2) For remaining blanks, query enrollments once and map by student_no
+    still_missing = (
+        fails.loc[fails["student_name"].isna(), "student_no"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    if still_missing:
+        lookup = {}
+        try:
+            cur = col("enrollments").find(
+                {"student.student_no": {"$in": still_missing}},
+                {"student.student_no": 1, "student.name": 1, "_id": 0},
+            )
+            for r in cur:
+                s = r.get("student", {})
+                sno = s.get("student_no")
+                nm = s.get("name")
+                # keep the first non-empty name we see for a student_no
+                if sno and nm and sno not in lookup:
+                    lookup[sno] = nm
+        except Exception:
+            lookup = {}
+
+        if lookup:
+            fails["student_name"] = fails["student_name"].fillna(
+                fails["student_no"].map(lookup)
+            )
+
+    # --- Display ---
     cols = [
         "term_label",
         "school_year",
@@ -422,6 +455,7 @@ def render_failed_students_by_subject(df: pd.DataFrame, passing: float = 75.0) -
         by=["term_label", "subject_code", "student_name"],
         key=lambda s: _sort_key_for_series_of_term_labels(s) if s.name == "term_label" else s,
     )
+
     st.dataframe(fails, use_container_width=True, height=min(600, 38 + 28 * len(fails)))
 
 
@@ -573,6 +607,19 @@ def render_curriculum_progress_advising() -> None:
 
     stud_df = _load_all_enrollments_for_student(student_no, student_email)
     curri = _find_curriculum_doc(sel_course)
+
+    # --- NEW: back-fill missing name / number from enrollments ---
+    # Some databases don’t store name/number in the quick lookup we did above.
+    # If we have enrollments, extract the first non-null values and show them.
+    if not student_name and not stud_df.empty and "student_name" in stud_df.columns:
+        s = stud_df["student_name"].dropna()
+        if not s.empty:
+            student_name = str(s.iloc[0])
+    if not student_no and not stud_df.empty and "student_no" in stud_df.columns:
+        s = stud_df["student_no"].dropna()
+        if not s.empty:
+            student_no = str(s.iloc[0])
+    # -------------------------------------------------------------
 
     # Student Info
     with st.container():
