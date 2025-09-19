@@ -251,29 +251,57 @@ def render_deans_list(df: pd.DataFrame, min_gpa: float):
     st.dataframe(per, use_container_width=True)
 
 
-def render_probation(df: pd.DataFrame, max_gpa: float):
+def render_probation(
+    df: pd.DataFrame,
+    max_gpa: float,
+    fail_pct_threshold: float,
+    pass_cutoff: float = 75.0,
+) -> None:
+    """Students on probation if GPA <= max_gpa OR fail% >= fail_pct_threshold."""
     st.subheader("Student Academic Standing → Probation")
-    st.caption(f"Threshold: GPA ≤ {max_gpa}")
+    st.caption(f"Thresholds: GPA ≤ {max_gpa}  •  Fail % ≥ {fail_pct_threshold}  (Fail = grade < {pass_cutoff})")
 
     if df.empty:
         _empty_state("No rows for the current filters.")
 
-    per = (
-        df.groupby(["student_no", "student_name", "term_label"], as_index=False)
-        .agg(GPA=("grade", "mean"), Subjects=("grade", "size"))
-    )
-    per = per[per["GPA"] <= float(max_gpa)]
-    if not per.empty:
-        per = per.sort_values(
-            by=["term_label", "GPA"],
-            ascending=[True, True],
-            key=lambda s: _sort_key_for_series_of_term_labels(s) if s.name == "term_label" else s,
-        )
-        per["GPA"] = per["GPA"].round(2)
-    else:
-        st.info("No students matched the probation threshold.")
+    d = df.copy()
+    d["grade_num"] = pd.to_numeric(d.get("grade"), errors="coerce")
+    d = d[~d["grade_num"].isna()]  # only numeric grades contribute to GPA/fail%
+
+    if d.empty:
+        st.info("No numeric grades to compute GPA / fail rates.")
         return
-    st.dataframe(per, use_container_width=True)
+
+    # mark fails
+    d["is_fail"] = d["grade_num"] < float(pass_cutoff)
+
+    # per-student per-term stats
+    agg = (
+        d.groupby(["student_no", "student_name", "term_label"], as_index=False)
+         .agg(
+             GPA=("grade_num", "mean"),
+             Subjects=("grade_num", "size"),
+             Fails=("is_fail", "sum"),
+         )
+    )
+    agg["Fail %"] = (agg["Fails"] / agg["Subjects"] * 100).round(2)
+
+    # probation rule: GPA low OR fail% high
+    prob = agg[(agg["GPA"] <= float(max_gpa)) | (agg["Fail %"] >= float(fail_pct_threshold))].copy()
+
+    if prob.empty:
+        st.info("No students matched the probation thresholds.")
+        return
+
+    prob["GPA"] = prob["GPA"].round(2)
+
+    prob = prob.sort_values(
+        by=["term_label", "Fail %", "GPA"],
+        ascending=[True, False, True],
+        key=lambda s: _sort_key_for_series_of_term_labels(s) if s.name == "term_label" else s,
+    )
+
+    st.dataframe(prob, use_container_width=True)
 
 
 def render_incomplete_grades(df: pd.DataFrame):
