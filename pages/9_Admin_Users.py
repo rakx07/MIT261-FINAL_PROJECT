@@ -5,6 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from db import col
 from utils import auth
 from utils.mongo_df import docs_to_df
 from utils.auth import require_role
@@ -23,6 +24,7 @@ tabs = st.tabs(
         "Create User",
         "Import from Teachers",
         "Import from Students",
+        "Sync from Enrollments",   # ⬅️ NEW
         "Directory / Export / Reset",
     ]
 )
@@ -115,9 +117,86 @@ with tabs[2]:
         )
 
 # -------------------------------
-# 4) Directory / Export / Reset
+# 4) Sync from Enrollments (NEW)
 # -------------------------------
 with tabs[3]:
+    st.subheader("Sync accounts from the enrollments collection")
+
+    def _distinct_from_enrollments(path_email: str, path_name: str) -> list[dict]:
+        """Return [{'email':..., 'name':...}, ...] from enrollments.<path> (lower-cased emails, deduped)."""
+        pipe = [
+            {"$match": {path_email: {"$exists": True, "$ne": ""}}},
+            {"$group": {"_id": f"${path_email}", "name": {"$last": f"${path_name}"}}},
+            {"$sort": {"_id": 1}},
+        ]
+        seen, out = set(), []
+        for r in col("enrollments").aggregate(pipe):
+            em = (r.get("_id") or "").strip().lower()
+            nm = r.get("name") or em
+            if em and em not in seen:
+                seen.add(em)
+                out.append({"email": em, "name": nm})
+        return out
+
+    # gather all emails already present in Users (any role)
+    existing = {u["email"].strip().lower() for u in auth.list_users({}, {"email": 1}) if u.get("email")}
+    st.caption(f"Existing users in DB: **{len(existing)}**")
+
+    colL, colR = st.columns(2)
+    with colL:
+        st.markdown("**Students (from enrollments.student.email)**")
+        studs = _distinct_from_enrollments("student.email", "student.name")
+        studs_missing = [d for d in studs if d["email"] not in existing]
+        st.write(f"Found in enrollments: {len(studs)} · Missing in Users: {len(studs_missing)}")
+        if studs_missing:
+            dfm = pd.DataFrame(studs_missing)
+            st.dataframe(dfm, use_container_width=True, hide_index=True, height=240)
+            if st.button("Create missing student accounts", type="primary", key="mk_students"):
+                created = []
+                for d in studs_missing:
+                    temp = auth._gen_temp_pw()
+                    auth.create_user(d["email"], d["name"], "student", temp, must_change_password=True)
+                    created.append({**d, "role": "student", "temp_password": temp})
+                st.session_state["last_created_accounts"] = created
+                st.success(f"Created {len(created)} student account(s). See temps below.")
+        else:
+            st.info("No missing student accounts.")
+
+    with colR:
+        st.markdown("**Teachers (from enrollments.teacher.email)**")
+        teach = _distinct_from_enrollments("teacher.email", "teacher.name")
+        teach_missing = [d for d in teach if d["email"] not in existing]
+        st.write(f"Found in enrollments: {len(teach)} · Missing in Users: {len(teach_missing)}")
+        if teach_missing:
+            dft = pd.DataFrame(teach_missing)
+            st.dataframe(dft, use_container_width=True, hide_index=True, height=240)
+            if st.button("Create missing teacher accounts", type="primary", key="mk_teachers_enr"):
+                created = []
+                for d in teach_missing:
+                    temp = auth._gen_temp_pw()
+                    auth.create_user(d["email"], d["name"], "teacher", temp, must_change_password=True)
+                    created.append({**d, "role": "teacher", "temp_password": temp})
+                st.session_state["last_created_accounts"] = created
+                st.success(f"Created {len(created)} teacher account(s). See temps below.")
+        else:
+            st.info("No missing teacher accounts.")
+
+    if st.session_state["last_created_accounts"]:
+        df = pd.DataFrame(st.session_state["last_created_accounts"])
+        st.warning("Copy or download these temporary passwords now — they are NOT stored in plaintext.")
+        st.dataframe(df, use_container_width=True)
+        st.download_button(
+            "Download newly-created accounts (CSV)",
+            df.to_csv(index=False).encode("utf-8"),
+            "new_accounts_from_enrollments.csv",
+            "text/csv",
+            key="dl_from_enrollments",
+        )
+
+# -------------------------------
+# 5) Directory / Export / Reset
+# -------------------------------
+with tabs[4]:
     st.subheader("User Directory (filter, export, bulk temp reset)")
 
     # ---- filters
