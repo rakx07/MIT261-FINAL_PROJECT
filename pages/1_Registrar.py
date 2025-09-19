@@ -586,28 +586,33 @@ def render_curriculum_progress_advising() -> None:
             """
         )
 
+    # If no curriculum doc, show what the student has taken
     if not curri:
         st.warning("No curriculum document found for this course code. Showing taken subjects only.")
         if stud_df.empty:
             st.info("No enrollments for this student.")
             return
 
-        show_cols = [
-            "term_label",
-            "subject_code",
-            "subject_title",
-            "grade",
-            "remark",
-            "teacher_name",
-            "section",
-        ]
-        for c in show_cols:
+        # Make sure columns exist even if absent in DB
+        must_cols = ["term_label", "subject_code", "subject_title", "grade", "remark", "teacher_name", "section"]
+        for c in must_cols:
             if c not in stud_df.columns:
                 stud_df[c] = np.nan
+
         st.dataframe(
-            stud_df[show_cols].sort_values(
-                by=["term_label", "subject_code"],
-                key=lambda s: _sort_key_for_series_of_term_labels(s) if s.name == "term_label" else s,
+            stud_df[must_cols].rename(
+                columns={
+                    "subject_code": "Code",
+                    "subject_title": "Description",
+                    "grade": "Grade",
+                    "remark": "Remark",
+                    "teacher_name": "Teacher",
+                    "section": "Section",
+                    "term_label": "Term",
+                }
+            ).sort_values(
+                by=["Term", "Code"],
+                key=lambda s: _sort_key_for_series_of_term_labels(s) if s.name == "Term" else s,
             ),
             use_container_width=True,
             height=min(640, 38 + 28 * len(stud_df)),
@@ -633,14 +638,17 @@ def render_curriculum_progress_advising() -> None:
         "prerequisites": "prerequisites",
     }
     cur_df = cur_df.rename(columns=ren)
-    for need in ["yearLevel", "semester", "subjectCode", "subjectName", "units"]:
+    for need in ["yearLevel", "semester", "subjectCode", "subjectName", "units", "prerequisites"]:
         if need not in cur_df.columns:
             cur_df[need] = np.nan
 
-    # Map enrollments to curriculum
-    take = stud_df.copy()
-    take = take[["subject_code", "grade", "remark", "term_label", "teacher_name", "section"]]
-    take = take.rename(columns={"subject_code": "subjectCode"})
+    # Ensure the student enrollments have all columns we want to show
+    needed_from_enr = ["subject_code", "grade", "remark", "term_label", "teacher_name", "section"]
+    for c in needed_from_enr:
+        if c not in stud_df.columns:
+            stud_df[c] = np.nan
+
+    take = stud_df[needed_from_enr].rename(columns={"subject_code": "subjectCode"})
     merged = cur_df.merge(take, on="subjectCode", how="left")
 
     # Status
@@ -660,6 +668,14 @@ def render_curriculum_progress_advising() -> None:
         return r or "NOT TAKEN"
 
     merged["Status"] = merged.apply(_status, axis=1)
+
+    # Pretty prerequisites
+    def _prettify_prereq(v):
+        if isinstance(v, (list, tuple)):
+            return ", ".join([_safe_str(x) for x in v if _safe_str(x)])
+        return _safe_str(v)
+
+    merged["prerequisites"] = merged["prerequisites"].map(_prettify_prereq)
 
     # Display by Year → Semester
     for yr in sorted(merged["yearLevel"].dropna().astype(int).unique().tolist()):
@@ -688,6 +704,7 @@ def render_curriculum_progress_advising() -> None:
                     "term_label": "Term",
                     "teacher_name": "Teacher",
                     "section": "Section",
+                    "prerequisites": "Prerequisites",
                 }
             )
             st.dataframe(
