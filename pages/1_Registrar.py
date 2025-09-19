@@ -356,15 +356,85 @@ def render_subject_pass_fail(df: pd.DataFrame, pass_cutoff: float = 75.0):
 
 
 def render_enrollment_analysis(df: pd.DataFrame):
-    st.subheader("Enrollment Analysis (rows per term & subject)")
+    """Enrollment Trend Analysis (term-over-term).
+
+    Columns:
+      - Semester: term label (e.g., '2023-2024 S1')
+      - Total Enrollment: unique students in the term
+      - New Enrollees: students whose first-ever term is this term
+      - Dropouts: students in previous term who are not in this term
+      - Retention Rate (%): retained_from_prev / prev_total * 100
+    """
+    st.subheader("Enrollment Trend Analysis")
     if df.empty:
         _empty_state("No rows for the current filters.")
-    g = (
-        df.groupby(["term_label", "subject_code"], as_index=False)
-        .size()
-        .sort_values(by="term_label", key=_sort_key_for_series_of_term_labels)
+
+    # unique (student, term) pairs
+    stu_term = (
+        df[["student_no", "term_label"]]
+        .dropna()
+        .drop_duplicates()
     )
-    st.dataframe(g, use_container_width=True)
+    if stu_term.empty:
+        st.info("No student/term combinations found.")
+        return
+
+    # sort terms using the helpers already in this page
+    terms = sorted(
+        stu_term["term_label"].unique().tolist(),
+        key=lambda x: (_parse_term_label(x)[0], _parse_term_label(x)[1] or 0),
+    )
+    order_map = {t: i for i, t in enumerate(terms)}
+
+    # first appearance (term) for each student
+    tmp = stu_term.assign(order=stu_term["term_label"].map(order_map))
+    first_by_student = (
+        tmp.sort_values("order")
+        .groupby("student_no", as_index=False)
+        .first()[["student_no", "term_label"]]
+    )
+    first_term_map = dict(zip(first_by_student["student_no"], first_by_student["term_label"]))
+
+    rows = []
+    prev_set: set[str] = set()
+
+    for idx, term in enumerate(terms):
+        cur_set = set(stu_term.loc[stu_term["term_label"] == term, "student_no"])
+        total = len(cur_set)
+
+        # new = first-ever term equals current term
+        new_count = sum(1 for s in cur_set if first_term_map.get(s) == term)
+
+        # dropouts = previous term students who didn't show up now
+        dropouts = len(prev_set - cur_set) if idx > 0 else 0
+
+        # retention = stayed from previous term / previous term total
+        if idx > 0 and len(prev_set) > 0:
+            retained = len(prev_set & cur_set)
+            retention = retained / len(prev_set) * 100.0
+        else:
+            retention = None  # no prior term to compare
+
+        rows.append(
+            {
+                "Semester": term,
+                "Total Enrollment": total,
+                "New Enrollees": new_count,
+                "Dropouts": dropouts,
+                "Retention Rate (%)": (round(retention, 2) if retention is not None else None),
+            }
+        )
+
+        prev_set = cur_set
+
+    out = pd.DataFrame(rows)
+
+    # pretty % display (first term -> "—")
+    out["Retention Rate (%)"] = out["Retention Rate (%)"].map(
+        lambda v: (f"{v:.0f}%" if pd.notna(v) else "—")
+    )
+
+    st.dataframe(out, use_container_width=True)
 
 
 # (Your updated incomplete grades logic kept as before)

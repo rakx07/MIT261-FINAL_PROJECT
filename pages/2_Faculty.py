@@ -13,6 +13,7 @@ from utils.auth import require_role, current_user
 
 from utils.auth import current_user  # already available in your auth helpers
 
+
 def _user_header(u: dict | None):
     if not u:
         return
@@ -34,6 +35,7 @@ def _user_header(u: dict | None):
         """,
         unsafe_allow_html=True,
     )
+
 
 # ──────────────────────────────────────────
 # Helpers
@@ -193,8 +195,6 @@ def main():
         u = get_current_user() or current_user()
     _user_header(u)
 
-
-
     teacher_email: Optional[str] = None
     teachers = list_teacher_emails()
 
@@ -236,31 +236,142 @@ def main():
     if sel_progs:
         df = df[df["program_code"].isin(sel_progs)]
 
-    # 1) Histogram
-    st.subheader("1) Class Grade Distribution (Histogram)")
+    # 1) Class Grade Distribution
+    st.subheader("1) Class Grade Distribution")
+
+    # Faculty Name field – show selected teacher if registrar/admin (FIX)
+    faculty_display_name = user.get("name") or ""
+    if role in ("registrar", "admin") and teacher_email:
+        # lookup name from teachers list
+        match = next((nm for nm, em in teachers if em == teacher_email), None)
+        if match:
+            faculty_display_name = match
+
+    # Header fields (like your sample)
+    hc1, hc2 = st.columns([1, 1.4])
+    with hc1:
+        st.text_input("Faculty Name:", value=faculty_display_name, key="faculty_name_display")
+    with hc2:
+        st.text_input(
+            "Semester and School Year:",
+            value=", ".join(sel_terms) if sel_terms else "",
+            key="term_sy_display",
+        )
+
     graded = df.dropna(subset=["grade"])
     if graded.empty:
         st.info("No graded entries found for this scope.")
     else:
-        bins = list(range(60, 101, 5))
-        hist = pd.cut(graded["grade"], bins=bins, right=True, include_lowest=True).value_counts().sort_index()
-        chart_df = pd.DataFrame({"range": hist.index.astype(str), "count": hist.values}).set_index("range")
+        # ——— Build the subject-by-bin distribution table (percentages) ———
+        bins = [0, 75, 80, 85, 90, 95, 100]
+        labels = ["Below 75 (%)", "75–79 (%)", "80–84 (%)", "85–89 (%)", "90–94 (%)", "95–100 (%)"]
+
+        tmp = graded.copy()
+        tmp["Course Code"] = tmp["subject_code"].fillna("")
+        tmp["Course Name"] = tmp["subject_title"].fillna("")
+        tmp["bin"] = pd.cut(tmp["grade"], bins=bins, labels=labels, right=True, include_lowest=True)
+
+        counts = (
+            tmp.groupby(["Course Code", "Course Name", "bin"])
+               .size()
+               .unstack(fill_value=0)
+        )
+
+        for col in labels:
+            if col not in counts.columns:
+                counts[col] = 0
+
+        counts = counts[labels]
+        totals = counts.sum(axis=1)
+        pct = (counts.div(totals.replace(0, 1), axis=0) * 100).round(0).astype("Int64").astype(str) + "%"
+
+        pct["Total"] = totals.values
+        pct = pct.reset_index()
+
+        st.dataframe(
+            pct[["Course Code", "Course Name"] + labels + ["Total"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("**Followed by: histogram**")
+        hist_bins = list(range(60, 101, 5))
+        hist_counts = pd.cut(
+            graded["grade"], bins=hist_bins, right=True, include_lowest=True
+        ).value_counts().sort_index()
+        chart_df = pd.DataFrame(
+            {"Range": hist_counts.index.astype(str), "Count": hist_counts.values}
+        ).set_index("Range")
         st.bar_chart(chart_df)
 
-    # 2) Avg by term
-    st.subheader("2) Student Progress Tracker (Avg by Term)")
-    if graded.empty:
-        st.info("No data to compute term averages.")
-    else:
-        g = (
-            graded.groupby("term_label", as_index=False)["grade"]
-            .mean()
-            .rename(columns={"grade": "avg_grade"})
-        )
-        g = g.sort_values(by="term_label", key=lambda s: s.map(_term_sort_key)).set_index("term_label")
-        st.line_chart(g)
+    # 2) Student Progress Tracker  (REPLACED your old "Avg by term")
+    st.subheader("2) Student Progress Tracker")
+    st.caption("Shows longitudinal performance for individual students. Filtered by Subject or Course or YearLevel.")
 
-    # 3) Fail %
+    if graded.empty:
+        st.info("No data available for student progress.")
+    else:
+        g = graded.copy()
+        # GPA scale (0–4), like the screenshot
+        g["gpa"] = (g["grade"].astype(float) / 100.0 * 4.0).clip(0, 4).round(2)
+
+        # pick terms for columns: prefer selected terms; else latest 3
+        terms_order = sel_terms if sel_terms else \
+            sorted(g["term_label"].dropna().unique().tolist(), key=_term_sort_key)
+        if len(terms_order) > 3:
+            terms_order = terms_order[-3:]
+
+        pivot = (
+            g[g["term_label"].isin(terms_order)]
+            .groupby(["student_no", "student_name", "term_label"])["gpa"]
+            .mean()
+            .reset_index()
+            .pivot_table(index=["student_no", "student_name"],
+                         columns="term_label", values="gpa", aggfunc="mean")
+            .reindex(columns=terms_order)
+        )
+
+        # Trend like in image (↑ Improving / ↓ Needs Attention / → Stable High)
+        def trend_text(row):
+            vals = [v for v in row.tolist() if pd.notnull(v)]
+            if len(vals) < 2:
+                return "—"
+            delta = vals[-1] - vals[0]
+            if delta >= 0.10:
+                return "↑ Improving"
+            if delta <= -0.10:
+                return "↓ Needs Attention"
+            return "→ Stable High"
+
+        trend = pivot.apply(trend_text, axis=1)
+        pivot_display = pivot.copy().round(2)
+        pivot_display.insert(0, "Student ID", [i[0] for i in pivot_display.index])
+        pivot_display.insert(1, "Name", [i[1] for i in pivot_display.index])
+        pivot_display["Overall Trend"] = trend.values
+        pivot_display = pivot_display.reset_index(drop=True)
+
+        st.dataframe(
+            pivot_display[["Student ID", "Name"] + terms_order + ["Overall Trend"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("**Followed by: line graph / scatter chart.**")
+        long_df = (
+            pivot.reset_index()
+                 .melt(id_vars=["student_no", "student_name"],
+                       value_vars=terms_order, var_name="Term", value_name="GPA")
+                 .dropna(subset=["GPA"])
+                 .sort_values(["student_no", "Term"])
+        )
+        chart_wide = (
+            long_df.pivot_table(index="Term", columns="student_name",
+                                values="GPA", aggfunc="mean")
+                   .reindex(terms_order)
+        )
+        st.line_chart(chart_wide)
+
+    # 3) Subject Difficulty Heatmap (Fail %)
     st.subheader("3) Subject Difficulty Heatmap (Fail %)")
     if graded.empty:
         st.info("No data for fail rates.")
@@ -303,7 +414,7 @@ def main():
             )
             st.dataframe(show, use_container_width=True, height=min(520, 35 + 28 * len(show)))
 
-    # 5) Submission status (keep ungraded)
+    # 5) Grade Submission Status (keep ungraded)
     st.subheader("5) Grade Submission Status")
     if df.empty:
         st.info("No enrollments to summarize.")
