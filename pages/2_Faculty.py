@@ -11,6 +11,29 @@ import streamlit as st
 from db import col
 from utils.auth import require_role, current_user
 
+from utils.auth import current_user  # already available in your auth helpers
+
+def _user_header(u: dict | None):
+    if not u:
+        return
+    st.markdown(
+        f"""
+        <div style="margin-top:-8px;margin-bottom:10px;padding:10px 12px;
+             border:1px solid rgba(0,0,0,.06); border-radius:10px;
+             background:linear-gradient(180deg,#0b1220 0%,#0e1729 100%);
+             color:#e6edff;">
+          <div style="font-size:14px;opacity:.85">Signed in as</div>
+          <div style="font-size:16px;font-weight:700;">{u.get('name','')}</div>
+          <div style="font-size:13px;opacity:.75;">{u.get('email','')}</div>
+          <div style="margin-top:6px;font-size:12px;display:inline-block;
+               padding:2px 6px;border:1px solid rgba(255,255,255,.12);
+               border-radius:6px;letter-spacing:.4px;">
+            {(u.get('role','') or '').upper()}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ──────────────────────────────────────────
 # Helpers
@@ -162,6 +185,15 @@ def main():
 
     st.title("🏫 Faculty Dashboard")
     st.caption("Teacher scope applies automatically for faculty. Registrars/Admins can filter by teacher.")
+    # show who is signed in
+    try:
+        u = user  # if you used require_role(...) and stored it as `user`
+    except NameError:
+        from utils.auth import get_current_user  # if you already use this helper on this page
+        u = get_current_user() or current_user()
+    _user_header(u)
+
+
 
     teacher_email: Optional[str] = None
     teachers = list_teacher_emails()
