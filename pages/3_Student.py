@@ -1,23 +1,55 @@
-# pages/3_Student.py
 from __future__ import annotations
 
+import io
 import math
-from typing import Dict, List, Optional, Tuple
+from datetime import date
+from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from db import col
-from utils.auth import require_role, current_user
+from utils.auth import current_user, require_role
+
+# ----------------------------
+# General helpers
+# ----------------------------
+
+def _term_label(sy: str | None, sem: int | str | None) -> str:
+    if not sy:
+        return "—"
+    try:
+        s = int(sem) if sem is not None and str(sem).strip() != "" else 0
+    except Exception:
+        s = 0
+    if isinstance(sem, str) and sem and not sem.isdigit():
+        # allows strings like "S1", "S2", "S3" (summer)
+        return f"{sy} {sem}"
+    return f"{sy} S{s}" if s else sy
 
 
-# ──────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────
-
-def _nemail(e: str | None) -> str:
-    return (e or "").strip().lower()
+def _term_sort_key(label: str) -> tuple[int, int]:
+    """
+    Sort like "2023-2024 S1" < "2023-2024 S2" < "2024-2025 S1".
+    Falls back gracefully for odd labels.
+    """
+    if not isinstance(label, str) or " " not in label:
+        return (0, 0)
+    part_sy, part_s = label.split(" ", 1)
+    try:
+        y0 = int(part_sy.split("-")[0])
+    except Exception:
+        y0 = 0
+    s = 0
+    try:
+        if part_s.startswith("S"):
+            s = int(part_s[1:])
+        elif part_s.isdigit():
+            s = int(part_s)
+    except Exception:
+        s = 0
+    return (y0, s)
 
 
 def _to_num_grade(x) -> float | None:
@@ -30,300 +62,636 @@ def _to_num_grade(x) -> float | None:
         return None
 
 
-def _term_label(sy: str | None, sem: int | None) -> str:
-    if not sy:
-        return "—"
-    try:
-        s = int(sem or 0)
-    except Exception:
-        s = 0
-    return f"{sy} S{s}" if s else sy
+# ----------------------------
+# Role / teacher helpers
+# ----------------------------
 
-
-def _term_sort_key(label: str) -> tuple[int, int]:
-    if not isinstance(label, str) or " S" not in label:
-        return (0, 0)
-    sy, s = label.split(" S", 1)
-    try:
-        start_year = int(sy.split("-")[0])
-    except Exception:
-        start_year = 0
-    try:
-        sem = int(s)
-    except Exception:
-        sem = 0
-    return (start_year, sem)
-
-
-@st.cache_data(show_spinner=False)
-def load_term_catalog() -> list[tuple[str, str, int]]:
+def list_teacher_emails() -> List[Tuple[str, str]]:
     """
-    Read the full school-year/semester catalog (including Summer S3) from `semesters`.
-    Returns a sorted list of (label, school_year, semester).
+    Returns [(name, email), ...] from enrollments.teacher.* if present.
     """
-    rows = list(col("semesters").find({}, {"school_year": 1, "semester": 1}))
-    seen = set()
-    out: list[tuple[str, str, int]] = []
-    for r in rows:
-        sy = r.get("school_year")
-        sem = r.get("semester")
-        if sy and sem is not None:
-            label = _term_label(sy, sem)
-            key = (label, sy, int(sem))
-            if key not in seen:
-                seen.add(key)
-                out.append(key)
-    out.sort(key=lambda t: _term_sort_key(t[0]))
+    pipe = [
+        {"$match": {"teacher.email": {"$exists": True, "$ne": ""}}},
+        {"$group": {"_id": "$teacher.email", "name": {"$first": "$teacher.name"}}},
+        {"$sort": {"_id": 1}},
+    ]
+    out = []
+    for r in col("enrollments").aggregate(pipe):
+        em = (r.get("_id") or "").strip().lower()
+        nm = r.get("name") or ""
+        if em:
+            out.append((nm or em, em))
     return out
 
 
+# ----------------------------
+# Curriculum / subject-units map
+# ----------------------------
+
 @st.cache_data(show_spinner=False)
-def curriculum_units_map() -> Dict[str, float]:
+def _build_subject_units_map() -> Dict[str, Dict[str, Any]]:
     """
-    Build a subjectCode -> units map from `curriculums` documents.
+    Build a {subject_code: {"units": int, "name": str}} map
+    by scanning likely curriculum collections.
     """
-    mapping: Dict[str, float] = {}
-    cur_docs = list(col("curriculums").find({}, {"subjects": 1}))
-    for doc in cur_docs:
-        for s in doc.get("subjects", []) or []:
-            code = s.get("subjectCode") or s.get("subject_code")
-            if not code:
-                continue
-            units = s.get("units")
-            if units is None:
-                # sometimes lec/lab are present
-                units = float((s.get("lec") or 0)) + float((s.get("lab") or 0))
-            try:
-                mapping[str(code)] = float(units or 0)
-            except Exception:
-                mapping[str(code)] = 0.0
+    mapping: Dict[str, Dict[str, Any]] = {}
+    candidates = ["curriculum", "curricula", "program_curricula", "prospectus", "curriculums"]
+    for cname in candidates:
+        try:
+            c = col(cname)
+        except Exception:
+            continue
+        try:
+            for doc in c.find({}, {"subjects": 1}):
+                subs = doc.get("subjects") or []
+                if isinstance(subs, list):
+                    for s in subs:
+                        code = (s.get("subjectCode") or s.get("code") or s.get("subject_code") or "").strip()
+                        if not code:
+                            continue
+                        units = s.get("units")
+                        if units is None:
+                            try:
+                                # some schemas keep lec/lab
+                                units = (s.get("lec") or 0) + (s.get("lab") or 0)
+                            except Exception:
+                                units = None
+                        name = s.get("subjectName") or s.get("name") or s.get("title")
+                        if code and code not in mapping:
+                            mapping[code] = {"units": units, "name": name}
+        except Exception:
+            pass
     return mapping
 
 
-def _subject_units(sub: dict, units_map: Dict[str, float]) -> float:
-    # prefer units inside enrollment.subject
-    if sub:
-        if sub.get("units") is not None:
-            try:
-                return float(sub.get("units") or 0)
-            except Exception:
-                pass
-        # fallback lec + lab
-        try:
-            v = float(sub.get("lec") or 0) + float(sub.get("lab") or 0)
-            if v:
-                return v
-        except Exception:
-            pass
-        # fallback to curriculum map
-        code = sub.get("code") or sub.get("subjectCode")
-        if code and code in units_map:
-            return float(units_map[code])
-    return 0.0
-
+# ----------------------------
+# Enrollment → df loader
+# ----------------------------
 
 @st.cache_data(show_spinner=False)
-def load_student_enrollments(email: Optional[str] = None, student_no: Optional[str] = None) -> pd.DataFrame:
+def load_enrollments_df(student_email: Optional[str] = None,
+                        student_no: Optional[str] = None,
+                        restrict_teacher_email: Optional[str] = None) -> pd.DataFrame:
     """
-    Load a single student's enrollments. Either `email` or `student_no` must be provided.
+    Pulls enrollments into a flattened DataFrame.
+    You can restrict to a student (email or no) and/or to a teacher's classes.
     """
-    if not email and not student_no:
-        return pd.DataFrame(columns=[
-            "term_label", "subject_code", "subject_title", "units", "grade", "remark",
-            "section", "teacher_name", "program_code"
-        ])
-
-    q = {}
-    if email:
-        q["student.email"] = _nemail(email)
+    q: Dict[str, Any] = {}
+    if student_email:
+        q["student.email"] = student_email.strip().lower()
     if student_no:
         q["student.student_no"] = student_no
+    if restrict_teacher_email:
+        q["teacher.email"] = restrict_teacher_email.strip().lower()
 
     proj = {
         "grade": 1,
         "remark": 1,
         "term.school_year": 1,
         "term.semester": 1,
+        "student.name": 1,
+        "student.student_no": 1,
+        "student.email": 1,
         "subject.code": 1,
         "subject.title": 1,
-        "subject.units": 1,
-        "subject.lec": 1,
-        "subject.lab": 1,
+        "teacher.email": 1,
         "teacher.name": 1,
         "program.program_code": 1,
         "section": 1,
     }
+
     rows = list(col("enrollments").find(q, proj))
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "student_no", "student_name", "student_email",
+                "subject_code", "subject_title", "grade", "remark",
+                "term_label", "teacher_email", "teacher_name",
+                "program_code", "section"
+            ]
+        )
 
-    u_map = curriculum_units_map()
-
-    def flatten(e: dict) -> dict:
+    def flatten(e):
         term = e.get("term") or {}
+        stu = e.get("student") or {}
         sub = e.get("subject") or {}
+        tch = e.get("teacher") or {}
         prog = e.get("program") or {}
         return {
-            "term_label": _term_label(term.get("school_year"), term.get("semester")),
+            "student_no": stu.get("student_no"),
+            "student_name": stu.get("name"),
+            "student_email": (stu.get("email") or "").strip().lower(),
             "subject_code": sub.get("code"),
             "subject_title": sub.get("title"),
-            "units": _subject_units(sub, u_map),
             "grade": _to_num_grade(e.get("grade")),
             "remark": e.get("remark"),
-            "section": e.get("section"),
-            "teacher_name": (e.get("teacher") or {}).get("name"),
+            "term_label": _term_label(term.get("school_year"), term.get("semester")),
+            "teacher_email": (tch.get("email") or "").strip().lower(),
+            "teacher_name": tch.get("name"),
             "program_code": prog.get("program_code"),
+            "section": e.get("section"),
         }
 
-    return pd.DataFrame([flatten(r) for r in rows])
+    df = pd.DataFrame([flatten(r) for r in rows])
+    return df
 
 
-# ──────────────────────────────────────────
+# ----------------------------
+# Prospectus helpers (from your evaluation page)
+# ----------------------------
+
+PASSING_GRADE = 75
+
+def _compute_semester_gpa(df_sem: pd.DataFrame) -> Optional[float]:
+    if df_sem.empty:
+        return None
+    u = pd.to_numeric(df_sem["units"], errors="coerce").fillna(0)
+    g = pd.to_numeric(df_sem["grade"], errors="coerce").fillna(0)
+    total_units = u.sum()
+    return round(float((g * u).sum() / total_units), 2) if total_units > 0 else None
+
+
+def _compute_prospectus_summary(df_all: pd.DataFrame) -> Dict[str, Any]:
+    if df_all.empty:
+        return dict(overall_gpa=None, total_units_earned=0, passed_cnt=0, failed_cnt=0, inprog_cnt=0)
+    df = df_all.copy()
+    df["units"] = pd.to_numeric(df["units"], errors="coerce").fillna(0)
+    df["grade_num"] = pd.to_numeric(df["grade"], errors="coerce")
+
+    passed_mask = df["grade_num"].ge(PASSING_GRADE)
+    failed_mask = df["grade_num"].lt(PASSING_GRADE)
+    inprog_mask = df["grade_num"].isna()
+
+    passed_cnt = int(passed_mask.sum())
+    failed_cnt = int(failed_mask.sum())
+    inprog_cnt = int(inprog_mask.sum())
+    total_units_earned = int(df.loc[passed_mask, "units"].sum())
+
+    g = df["grade_num"].fillna(0)
+    u = df["units"]
+    usable = df["grade_num"].notna() & u.gt(0)
+    overall_gpa = round(float((g[usable] * u[usable]).sum() / u[usable].sum()), 2) if usable.any() else None
+
+    return dict(
+        overall_gpa=overall_gpa,
+        total_units_earned=total_units_earned,
+        passed_cnt=passed_cnt,
+        failed_cnt=failed_cnt,
+        inprog_cnt=inprog_cnt,
+    )
+
+
+def _build_pdf(student: Dict[str, Any],
+               per_sem: Dict[str, pd.DataFrame],
+               gpa_points: List[Tuple[str, Optional[float]]],
+               summary: Dict[str, Any]) -> bytes:
+    # Light-weight PDF via ReportLab if available
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    except Exception:
+        return b""
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=36, bottomMargin=30)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph(f"Student Evaluation Sheet — {student.get('student_name','')}", styles["Title"]))
+    story.append(Paragraph(f"Program: {student.get('program_code','—')}    Student No: {student.get('student_no','—')}", styles["Normal"]))
+    story.append(Paragraph(f"Email: {student.get('student_email','—')}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    # Summary
+    story.append(Paragraph("Prospectus Summary", styles["Heading2"]))
+    sum_data = [
+        ["Overall GPA", summary["overall_gpa"] if summary["overall_gpa"] is not None else "—"],
+        ["Total Units Earned", summary["total_units_earned"]],
+        [f"Passed (≥ {PASSING_GRADE})", summary["passed_cnt"]],
+        [f"Failed (< {PASSING_GRADE})", summary["failed_cnt"]],
+        ["In-Progress / No Grade", summary["inprog_cnt"]],
+    ]
+    t_sum = Table(sum_data, hAlign="LEFT", colWidths=[180, 200])
+    t_sum.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef2ff")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+    ]))
+    story.append(t_sum)
+    story.append(Spacer(1, 14))
+
+    # Per-semester tables
+    for sem_label, df in per_sem.items():
+        story.append(Paragraph(sem_label, styles["Heading2"]))
+        data = [["Subject Code", "Description", "Units", "Final Grade", "Instructor"]]
+        for _, r in df.iterrows():
+            data.append([
+                r.get("subject_code", ""),
+                r.get("subject_title", ""),
+                int((r.get("units", 0) or 0)),
+                r.get("grade", ""),
+                r.get("teacher_name", "") or r.get("teacher_email", ""),
+            ])
+        gpa = _compute_semester_gpa(df)
+        total_units = int(pd.to_numeric(df["units"], errors="coerce").fillna(0).sum())
+        data.append(["", "Total Units", total_units, gpa if gpa is not None else "—", ""])
+
+        tbl = Table(data, hAlign="LEFT", colWidths=[80, None, 50, 70, 140])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26364a")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("ALIGN", (2, 1), (3, -1), "RIGHT"),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#eef2ff")),
+            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 12))
+
+    # Trend
+    if gpa_points:
+        story.append(Paragraph("GPA Trend", styles["Heading2"]))
+        trend = [["Semester", "GPA"]] + [[k, v if v is not None else "—"] for k, v in gpa_points]
+        t2 = Table(trend, hAlign="LEFT")
+        t2.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef2ff")),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+        ]))
+        story.append(t2)
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+# ----------------------------
+# Prospectus builder from enrollments
+# ----------------------------
+
+def build_prospectus(df_enr: pd.DataFrame,
+                     student_stub: Dict[str, Any]) -> Tuple[Dict[str, pd.DataFrame],
+                                                            List[Tuple[str, Optional[float]]],
+                                                            Dict[str, Any],
+                                                            pd.DataFrame]:
+    """
+    Convert the filtered enrollments of one student into a prospectus view.
+    Adds units by looking up a curriculum mapping when available.
+    """
+    if df_enr.empty:
+        return {}, [], student_stub, df_enr
+
+    units_map = _build_subject_units_map()
+    df = df_enr.copy()
+
+    # Attach units & nicer titles if curriculum has them
+    def _units_for(code: str | None) -> Optional[float]:
+        if not code:
+            return None
+        hit = units_map.get(code)
+        return hit.get("units") if hit else None
+
+    def _title_for(code: str | None, fallback: str | None) -> str | None:
+        if not code:
+            return fallback
+        hit = units_map.get(code)
+        return (hit.get("name") or fallback) if hit else fallback
+
+    df["units"] = df["subject_code"].map(lambda c: _units_for(c))
+    df["subject_title"] = df.apply(lambda r: _title_for(r["subject_code"], r["subject_title"]), axis=1)
+
+    # build order and group
+    order_df = df[["term_label"]].drop_duplicates()
+    order_df["sortkey"] = order_df["term_label"].map(_term_sort_key)
+    order_df = order_df.sort_values("sortkey")
+
+    per_sem: Dict[str, pd.DataFrame] = {}
+    gpa_points: List[Tuple[str, Optional[float]]] = []
+
+    for term in order_df["term_label"].tolist():
+        block = df[df["term_label"] == term].copy()
+        per_sem[term] = block[["subject_code", "subject_title", "units", "grade", "teacher_name", "teacher_email"]]
+        gpa_points.append((term, _compute_semester_gpa(block)))
+
+    return per_sem, gpa_points, student_stub, df
+
+
+# ----------------------------
 # Page
-# ──────────────────────────────────────────
+# ----------------------------
 
 def main():
-    # student can view self; registrar/admin can search
-    user = require_role("student", "registrar", "admin")
-    role = (user.get("role") or "").lower()
+    u = current_user()
+    role = (u.get("role") or "").lower()
 
-    st.title("🧑‍🎓 Student Dashboard")
-
-    df = pd.DataFrame()
-    picked_email = None
-    picked_no = None
-
-    if role == "student":
-        picked_email = _nemail(user.get("email"))
-        st.caption(f"Signed in as **{picked_email or user.get('email','(no email)')}**. Showing your records.")
-        df = load_student_enrollments(email=picked_email)
+    st.title("👨‍🎓 Student Dashboard")
+    if role in ("student",):
+        st.caption(f"Signed in as {u.get('email','')}. Showing your records.")
     else:
-        st.caption("Registrar/Admin: search a student by email or ID.")
-        c1, c2, c3 = st.columns([3, 2, 1])
-        with c1:
-            picked_email = _nemail(st.text_input("Student email (preferred)", ""))
-        with c2:
-            picked_no = st.text_input("Student No.", "")
-        with c3:
-            if st.button("Load", use_container_width=True):
-                st.session_state["_student_query"] = {"email": picked_email, "no": picked_no}
+        st.caption("Faculty mode: pick from your own classes by term and subject, then choose a student.")
 
-        q = st.session_state.get("_student_query", {})
-        if q:
-            df = load_student_enrollments(email=q.get("email") or None, student_no=q.get("no") or None)
+    # --- Role filters / scope ---
 
-    if df.empty:
-        st.warning("No enrollments found for this student.")
-        return
+    teacher_email: Optional[str] = None
+    teachers = list_teacher_emails()
 
-    # Global picker from semesters (all terms, including Summer)
-    term_catalog = load_term_catalog()
-    all_term_labels = [lbl for (lbl, _, _) in term_catalog]
+    if role in ("faculty", "teacher"):
+        teacher_email = (u.get("email") or "").strip().lower()
 
-    # Filters (do not change plots — they are computed from the filtered df)
-    fcols = st.columns(3)
-    with fcols[0]:
-        sel_terms = st.multiselect("Term(s)", options=all_term_labels, default=all_term_labels)
-    with fcols[1]:
-        section_opts = sorted([s for s in df["section"].dropna().unique().tolist() if s not in (None, "", "—")])
-        sel_sections = st.multiselect("Section(s)", options=section_opts, default=section_opts)
-    with fcols[2]:
-        subj_opts = sorted(df["subject_code"].dropna().unique().tolist())
-        sel_subjects = st.multiselect("Subject(s)", options=subj_opts, default=subj_opts)
+    # --- Top filters (teacher scope first, then choose a student) ---
 
-    dff = df.copy()
-    if sel_terms:
-        dff = dff[dff["term_label"].isin(sel_terms)]
+    # For faculty: terms and subjects they actually taught
+    df_scope = load_enrollments_df(restrict_teacher_email=teacher_email) if teacher_email else load_enrollments_df()
+
+    # Build options safely
+    all_terms = sorted([t for t in df_scope["term_label"].dropna().unique()], key=_term_sort_key)
+    default_terms = [t for t in all_terms[-3:]]  # last few by default
+
+    st.markdown("**Term(s)**")
+    sel_terms = st.multiselect("Term(s)",
+                               options=all_terms,
+                               default=[t for t in default_terms if t in all_terms],
+                               key="student_terms_top")
+
+    df_scope = df_scope[df_scope["term_label"].isin(sel_terms)] if sel_terms else df_scope
+
+    subjects = sorted(df_scope["subject_code"].dropna().unique())
+    st.markdown("**Subject(s)**")
+    sel_subjects = st.multiselect("Subject(s)", options=subjects, default=subjects[:2], key="student_subjects_top")
+
+    df_scope = df_scope[df_scope["subject_code"].isin(sel_subjects)] if sel_subjects else df_scope
+
+    sections = sorted([s for s in df_scope["section"].dropna().unique()])
+    st.markdown("**Section(s)**")
+    sel_sections = st.multiselect("Section(s)", options=sections, default=sections, key="student_sections_top")
     if sel_sections:
-        dff = dff[dff["section"].isin(sel_sections)]
-    if sel_subjects:
-        dff = dff[dff["subject_code"].isin(sel_subjects)]
+        df_scope = df_scope[df_scope["section"].isin(sel_sections)]
 
-    # ── 1) Academic Transcript Viewer
-    st.subheader("1) Academic Transcript Viewer  ↪")
+    # --- Pick student ---
 
-    if dff.empty:
-        st.info("No rows after filters.")
+    student_label = None
+    student_email = None
+    student_no = None
+
+    # If student is signed-in -> forced to own email
+    if role == "student":
+        student_email = (u.get("email") or "").strip().lower()
     else:
-        for term, block in dff.sort_values("term_label", key=lambda s: s.map(_term_sort_key)).groupby("term_label"):
-            # GPA for the term (weighted by units when available)
-            graded = block.dropna(subset=["grade"])
-            if not graded.empty:
-                w = graded["units"].replace({np.nan: 0.0}).astype(float)
-                g = graded["grade"].astype(float)
-                denom = (w.where(w > 0, 1.0))  # avoid division by zero if units missing
-                term_gpa = (g * denom).sum() / denom.sum()
-                gpa_txt = f"{term_gpa:.2f}"
-            else:
-                gpa_txt = "—"
+        # Registrar/Admin/Faculty can pick
+        stu_opts = (
+            df_scope[["student_name", "student_email", "student_no"]]
+            .dropna(subset=["student_email"])
+            .drop_duplicates()
+        )
+        if not stu_opts.empty:
+            def _fmt(r):
+                nm = r["student_name"] or ""
+                em = r["student_email"] or ""
+                no = r["student_no"] or ""
+                return f"{nm} ({no}) — {em}".strip()
 
-            units_sum = float(block["units"].fillna(0).sum())
-            st.markdown(f"**{term} · GPA:** {gpa_txt} · **Units:** {units_sum:g}")
+            labels = [_fmt(r) for _, r in stu_opts.iterrows()]
+            picked = st.selectbox("Student", options=labels, index=0 if labels else None, key="student_pick")
+            if picked:
+                row = stu_opts.iloc[labels.index(picked)]
+                student_label = picked
+                student_email = row["student_email"]
+                student_no = row["student_no"]
+        else:
+            st.info("No students found for the selected filters.")
 
-            show = (
-                block[["subject_code", "subject_title", "units", "grade", "remark"]]
-                .rename(columns={
-                    "subject_code": "Subject",
-                    "subject_title": "Description",
-                    "units": "units",
-                    "grade": "grade",
-                    "remark": "remark",
-                })
-            )
-            # make sure units display as ints if whole numbers
-            show["units"] = show["units"].map(lambda x: int(x) if pd.notna(x) and float(x).is_integer() else x)
-            st.dataframe(show, use_container_width=True)
+    # --- Load enrollments for selected student (or current student) ---
 
-    # ── 2) Performance Trend Over Time (GPA by term)
-    st.subheader("2) Performance Trend Over Time (Avg by Term)")
-    graded_all = dff.dropna(subset=["grade"])
-    if graded_all.empty:
-        st.info("No graded data after filters.")
+    df = load_enrollments_df(student_email=student_email,
+                             student_no=student_no,
+                             restrict_teacher_email=teacher_email)
+
+    # ----------------------------
+    # 1) Class Grade Distribution
+    # ----------------------------
+    st.subheader("1) Class Grade Distribution (Histogram)")
+    graded = df.dropna(subset=["grade"])
+    if graded.empty:
+        st.info("No graded entries found for this scope.")
+    else:
+        bins = list(range(60, 101, 5))
+        hist = pd.cut(graded["grade"], bins=bins, right=True, include_lowest=True).value_counts().sort_index()
+        chart_df = pd.DataFrame({"range": hist.index.astype(str), "count": hist.values}).set_index("range")
+        st.bar_chart(chart_df)
+
+    # ----------------------------
+    # 2) Student Progress Tracker
+    # ----------------------------
+    st.subheader("2) Student Progress Tracker (Avg by Term)")
+    if graded.empty:
+        st.info("No data to compute term averages.")
     else:
         g = (
-            graded_all.groupby("term_label", as_index=False)["grade"]
+            graded.groupby("term_label", as_index=False)["grade"]
             .mean()
             .rename(columns={"grade": "avg_grade"})
-            .sort_values("term_label", key=lambda s: s.map(_term_sort_key))
-            .set_index("term_label")
         )
+        g = g.sort_values(by="term_label", key=lambda s: s.map(_term_sort_key))
+        g = g.set_index("term_label")
         st.line_chart(g)
 
-    # ── 3) Passed vs Failed Summary
-    st.subheader("3) Passed vs Failed Summary")
-    if graded_all.empty:
-        st.info("No graded data to summarize.")
+    # ----------------------------
+    # 3) Subject Difficulty Heatmap
+    # ----------------------------
+    st.subheader("3) Subject Difficulty Heatmap (Fail %)")
+    if graded.empty:
+        st.info("No data for fail rates.")
     else:
-        pv = pd.Series(
-            {
-                "Passed": (graded_all["grade"] >= 75).sum(),
-                "Failed": (graded_all["grade"] < 75).sum(),
-                "Incomplete": (dff["remark"].fillna("").str.upper() == "INCOMPLETE").sum(),
-                "Dropped": (dff["remark"].fillna("").str.upper() == "DROPPED").sum(),
+        tmp = graded.copy()
+        tmp["is_fail"] = tmp["grade"] < 75
+        fail = (
+            tmp.groupby("subject_code", as_index=False)
+            .agg(total=("grade", "size"), fails=("is_fail", "sum"))
+        )
+        fail["fail_rate_%"] = (fail["fails"] / fail["total"] * 100).round(2)
+        if fail.empty:
+            st.info("No subjects to display.")
+        else:
+            fail = fail.sort_values("fail_rate_%", ascending=False)
+            st.dataframe(fail, use_container_width=True)
+
+    # ----------------------------
+    # 4) Intervention Candidates
+    # ----------------------------
+    st.subheader("4) Intervention Candidates")
+    if graded.empty:
+        st.info("No graded entries.")
+    else:
+        latest_term = None
+        if not graded["term_label"].isna().all():
+            latest_term = (
+                sorted(graded["term_label"].dropna().unique(), key=_term_sort_key)[-1]
+                if graded["term_label"].dropna().size
+                else None
+            )
+        cur = graded[graded["term_label"] == latest_term] if latest_term else graded
+
+        risk = cur[cur["grade"] < 75].copy()
+        risk = risk.sort_values(["student_name", "grade"])
+        if risk.empty:
+            st.success("No at-risk students in the latest term.")
+        else:
+            show = risk[["student_no", "student_name", "subject_code", "grade", "term_label"]]
+            show = show.rename(
+                columns={
+                    "student_no": "Student No",
+                    "student_name": "Student",
+                    "subject_code": "Subject",
+                    "grade": "Grade",
+                    "term_label": "Term",
+                }
+            )
+            st.dataframe(show, use_container_width=True, height=min(500, 35 + 28 * len(show)))
+
+    # ----------------------------
+    # 5) Grade Submission Status
+    # ----------------------------
+    st.subheader("5) Grade Submission Status")
+    df_status = df.copy()
+    if df_status.empty:
+        st.info("No enrollments to summarize.")
+    else:
+        status = (
+            df_status.groupby("subject_code")
+            .agg(
+                total=("grade", "size"),
+                graded_cnt=("grade", lambda s: s.notna().sum()),
+            )
+            .reset_index()
+        )
+        status["completion_%"] = (status["graded_cnt"] / status["total"] * 100).round(1)
+        status = status.sort_values(["completion_%", "subject_code"], ascending=[True, True])
+        status = status.rename(
+            columns={
+                "subject_code": "Subject",
+                "total": "Total Enrollments",
+                "graded_cnt": "Graded Count",
+                "completion_%": "Completion %",
             }
         )
-        st.bar_chart(pv.to_frame("count"))  # simple, readable
+        st.dataframe(status, use_container_width=True)
 
-    # ── 4) Subject Difficulty Ratings (fail % by subject for this student)
-    st.subheader("4) Subject Difficulty Ratings (per-subject status)")
-    if dff.empty:
-        st.info("No data to compute subject statuses.")
+    # ----------------------------
+    # 6) Prospectus / Curriculum Evaluation
+    # ----------------------------
+    st.subheader("6) Prospectus / Curriculum Evaluation")
+
+    if role == "student":
+        # Use the signed-in student's info
+        student_stub = {
+            "student_name": u.get("name") or "",
+            "student_email": u.get("email") or "",
+            "student_no": "",  # unknown from user record
+            "program_code": df["program_code"].dropna().iloc[0] if not df.empty else "",
+        }
     else:
-        sstats = (
-            dff.assign(
-                status=np.select(
-                    [
-                        dff["remark"].fillna("").str.upper().eq("DROPPED"),
-                        dff["remark"].fillna("").str.upper().eq("INCOMPLETE"),
-                        dff["grade"].fillna(1000) < 75,
-                        dff["grade"].notna() & (dff["grade"] >= 75),
-                    ],
-                    ["DROPPED", "INCOMPLETE", "FAILED", "PASSED"],
-                    default="—",
-                )
-            )[["subject_code", "subject_title", "status"]]
-            .rename(columns={"subject_code": "Subject", "subject_title": "Title", "status": "Status"})
-        )
-        st.dataframe(sstats, use_container_width=True)
+        if not student_email:
+            st.info("Select a student above to show the prospectus.")
+            return
+        # build a compact header from df
+        student_stub = {
+            "student_name": df["student_name"].dropna().iloc[0] if not df.empty else "",
+            "student_email": student_email or "",
+            "student_no": df["student_no"].dropna().iloc[0] if not df.empty else "",
+            "program_code": df["program_code"].dropna().iloc[0] if not df.empty else "",
+        }
+
+    # Optional extra filters for the prospectus area (safe keys to avoid duplicates)
+    with st.expander("Prospectus Filters", expanded=True):
+        # Terms specifically for this student
+        stu_terms = sorted([t for t in df["term_label"].dropna().unique()], key=_term_sort_key)
+        default_stu_terms = stu_terms  # show all by default
+        sel_terms_prosp = st.multiselect("Term(s)", options=stu_terms,
+                                         default=[t for t in default_stu_terms if t in stu_terms],
+                                         key="prospectus_terms")
+
+        df_for_prosp = df[df["term_label"].isin(sel_terms_prosp)] if sel_terms_prosp else df
+
+        # The user may also narrow on specific subjects/sections
+        subj_opts = sorted([s for s in df_for_prosp["subject_code"].dropna().unique()])
+        sel_subj_prosp = st.multiselect("Subject(s)", options=subj_opts, default=subj_opts, key="prospectus_subjects")
+
+        sect_opts = sorted([s for s in df_for_prosp["section"].dropna().unique()])
+        sel_sect_prosp = st.multiselect("Section(s)", options=sect_opts, default=sect_opts, key="prospectus_sections")
+
+        if sel_subj_prosp:
+            df_for_prosp = df_for_prosp[df_for_prosp["subject_code"].isin(sel_subj_prosp)]
+        if sel_sect_prosp:
+            df_for_prosp = df_for_prosp[df_for_prosp["section"].isin(sel_sect_prosp)]
+
+    if df_for_prosp.empty:
+        st.info("No enrollments to render for the selected prospectus filters.")
+        return
+
+    per_sem, gpa_points, student_hdr, df_curr = build_prospectus(df_for_prosp, student_stub)
+
+    # Summary tiles
+    summary = _compute_prospectus_summary(df_curr)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Overall GPA", summary["overall_gpa"] if summary["overall_gpa"] is not None else "—")
+    c2.metric("Units Earned", summary["total_units_earned"])
+    c3.metric(f"Passed (≥ {PASSING_GRADE})", summary["passed_cnt"])
+    c4.metric(f"Failed (< {PASSING_GRADE})", summary["failed_cnt"])
+    c5.metric("In-Progress", summary["inprog_cnt"])
+
+    # Per-semester tables
+    order = sorted(per_sem.keys(), key=_term_sort_key)
+    for sem_label in order:
+        block = per_sem[sem_label].copy()
+        gpa = _compute_semester_gpa(block)
+        total_units = int(pd.to_numeric(block["units"], errors="coerce").fillna(0).sum())
+        with st.expander(sem_label, expanded=True):
+            show = block.rename(columns={
+                "subject_code": "Subject Code",
+                "subject_title": "Description",
+                "units": "Units",
+                "grade": "Final Grade",
+                "teacher_name": "Instructor",
+            })
+            # prefer teacher_name, but keep email if no name
+            if "Instructor" in show and show["Instructor"].isna().all() and "teacher_email" in block:
+                show["Instructor"] = block["teacher_email"]
+            totals = pd.DataFrame([{
+                "Subject Code": "", "Description": "Total Units",
+                "Units": total_units, "Final Grade": gpa, "Instructor": ""
+            }])
+            st.dataframe(pd.concat([show, totals], ignore_index=True), use_container_width=True)
+            st.markdown(
+                f"**Semester GPA:** <span style='color:#1f5cff;font-weight:700'>{gpa if gpa is not None else '—'}</span>",
+                unsafe_allow_html=True
+            )
+
+    # Trend chart
+    st.markdown("**GPA Trend**")
+    trend_df = pd.DataFrame(gpa_points, columns=["Semester", "GPA"]).set_index("Semester").dropna()
+    if not trend_df.empty:
+        st.line_chart(trend_df)
+    else:
+        st.caption("No numeric GPA values yet to chart.")
+
+    # PDF download
+    pdf_bytes = _build_pdf(student_hdr, per_sem, gpa_points, summary)
+    st.download_button(
+        "Download PDF",
+        data=pdf_bytes if pdf_bytes else b"",
+        file_name=f"evaluation_{(student_hdr.get('student_no') or 'student')}_{date.today().isoformat()}.pdf",
+        mime="application/pdf",
+        disabled=(pdf_bytes is None or len(pdf_bytes) == 0),
+        key="prospectus_pdf_dl",
+    )
 
 
 if __name__ == "__main__":
+    # Guard access: students can view, faculty/registrar/admin too.
+    # If you want to restrict further, swap the roles here.
+    require_role("student", "teacher", "faculty", "registrar", "admin")
     main()
