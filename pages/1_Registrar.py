@@ -277,6 +277,7 @@ def render_probation(df: pd.DataFrame, max_gpa: float):
 
 
 def render_incomplete_grades(df: pd.DataFrame):
+    """Incomplete / Dropped grades with student & teacher names back-filled."""
     st.subheader("Incomplete Grades Report")
 
     if df.empty:
@@ -286,8 +287,13 @@ def render_incomplete_grades(df: pd.DataFrame):
     INC_STAT = {"INC", "INCOMPLETE", "INCOMP"}
     DRP_STAT = {"DROP", "DROPPED", "DRP", "WITHDRAWN", "WD", "W"}
 
+    # Ensure helper for blank checks
+    def _is_blank(series: pd.Series) -> pd.Series:
+        return series.isna() | (series.astype(str).str.strip() == "")
+
+    # Normalize sources
     remark = df.get("remark", pd.Series(dtype=object)).astype(str).str.upper()
-    raw = df.get("raw_grade", pd.Series(dtype=object)).astype(str).str.upper()
+    raw    = df.get("raw_grade", pd.Series(dtype=object)).astype(str).str.upper()
 
     mask_inc = remark.isin(INC_STAT) | raw.isin(INC_STAT)
     mask_drp = remark.isin(DRP_STAT) | raw.isin(DRP_STAT)
@@ -297,21 +303,129 @@ def render_incomplete_grades(df: pd.DataFrame):
         st.success("No INC or DROPPED grades in the current scope.")
         return
 
-    # Friendly columns
-    show = incomplete[[
+    # ---------------------------
+    # Back-fill missing student_name
+    # ---------------------------
+    if {"student_no", "student_name"}.issubset(df.columns):
+        map_names = (
+            df[["student_no", "student_name"]]
+            .dropna()
+            .drop_duplicates()
+            .set_index("student_no")["student_name"]
+        )
+        incomplete["student_name"] = incomplete["student_name"].fillna(
+            incomplete["student_no"].map(map_names)
+        )
+
+    need_students = (
+        incomplete.loc[_is_blank(incomplete["student_name"]), "student_no"]
+        .dropna().unique().tolist()
+    )
+    if need_students:
+        lookup = {}
+        try:
+            cur = col("enrollments").find(
+                {"student.student_no": {"$in": need_students}},
+                {"student.student_no": 1, "student.name": 1, "_id": 0},
+            )
+            for r in cur:
+                s = r.get("student", {})
+                sno, nm = s.get("student_no"), s.get("name")
+                if sno and nm and sno not in lookup:
+                    lookup[sno] = nm
+        except Exception:
+            lookup = {}
+        if lookup:
+            incomplete["student_name"] = incomplete["student_name"].fillna(
+                incomplete["student_no"].map(lookup)
+            )
+
+    # ---------------------------
+    # Back-fill missing teacher_name
+    # ---------------------------
+    # Step 1: map teacher_email -> teacher_name using current DF
+    if {"teacher_email", "teacher_name"}.issubset(df.columns):
+        email_to_name = (
+            df.loc[~_is_blank(df["teacher_email"]) & ~_is_blank(df["teacher_name"]),
+                   ["teacher_email", "teacher_name"]]
+            .drop_duplicates()
+            .set_index("teacher_email")["teacher_name"]
+        )
+        mask_missing_tname = _is_blank(incomplete["teacher_name"])
+        if not email_to_name.empty and "teacher_email" in incomplete.columns:
+            fills = incomplete.loc[mask_missing_tname, "teacher_email"].map(email_to_name)
+            incomplete.loc[mask_missing_tname, "teacher_name"] = incomplete.loc[mask_missing_tname, "teacher_name"].fillna(fills)
+
+    # Step 2: most common teacher per (term_label, subject_code, section) in current DF
+    for c in ["term_label", "subject_code", "section", "teacher_name"]:
+        if c not in df.columns:
+            df[c] = np.nan
+    known = df.loc[~_is_blank(df["teacher_name"])].copy()
+    if not known.empty:
+        try:
+            key_cols = ["term_label", "subject_code", "section"]
+            common_map = (
+                known.groupby(key_cols)["teacher_name"]
+                .agg(lambda s: s.value_counts().index[0])
+            )
+            mask_missing_tname = _is_blank(incomplete["teacher_name"])
+            if mask_missing_tname.any():
+                key_df = incomplete.loc[mask_missing_tname, key_cols]
+                tuple_keys = list(map(tuple, key_df.values))
+                mapped = pd.Series(tuple_keys).map(common_map.to_dict())
+                incomplete.loc[mask_missing_tname, "teacher_name"] = incomplete.loc[mask_missing_tname, "teacher_name"].fillna(mapped.values)
+        except Exception:
+            pass
+
+    # Step 3: one-shot DB lookup by missing teacher emails
+    mask_missing_tname = _is_blank(incomplete["teacher_name"])
+    if mask_missing_tname.any() and "teacher_email" in incomplete.columns:
+        missing_emails = (
+            incomplete.loc[mask_missing_tname, "teacher_email"]
+            .dropna().astype(str).str.strip().unique().tolist()
+        )
+        if missing_emails:
+            email_lookup = {}
+            try:
+                cur = col("enrollments").find(
+                    {"teacher.email": {"$in": missing_emails}},
+                    {"teacher.email": 1, "teacher.name": 1, "_id": 0},
+                )
+                for r in cur:
+                    t = r.get("teacher", {})
+                    em, nm = t.get("email"), t.get("name")
+                    if em and nm and em not in email_lookup:
+                        email_lookup[em] = nm
+            except Exception:
+                email_lookup = {}
+            if email_lookup:
+                fills = incomplete.loc[mask_missing_tname, "teacher_email"].map(email_lookup)
+                incomplete.loc[mask_missing_tname, "teacher_name"] = incomplete.loc[mask_missing_tname, "teacher_name"].fillna(fills)
+
+    # ---------------------------
+    # Display
+    # ---------------------------
+    cols = [
         "term_label","school_year","semester",
         "subject_code","subject_title",
         "student_no","student_name",
         "raw_grade","remark",
         "teacher_name","section","department"
-    ]].rename(columns={
-        "raw_grade": "grade_text"
-    }).sort_values(
-        by=["term_label","subject_code","student_name"],
-        key=lambda s: _sort_key_for_series_of_term_labels(s) if s.name == "term_label" else s
+    ]
+    for c in cols:
+        if c not in incomplete.columns:
+            incomplete[c] = np.nan
+
+    show = (
+        incomplete[cols]
+        .rename(columns={"raw_grade": "grade_text"})
+        .sort_values(
+            by=["term_label","subject_code","student_name"],
+            key=lambda s: _sort_key_for_series_of_term_labels(s) if s.name == "term_label" else s,
+        )
     )
 
-    st.caption("Rows where grade/remark indicates INC or DROPPED.")
+    st.caption("Rows where grade/remark indicates INC or DROPPED. Names back-filled when possible.")
     st.dataframe(show, use_container_width=True, height=min(600, 38 + 28 * len(show)))
 
 
@@ -376,7 +490,7 @@ def render_top_performers_per_program(df: pd.DataFrame, topn: int = 10):
 # -----------------------------
 
 def render_failed_students_by_subject(df: pd.DataFrame, passing: float = 75.0) -> None:
-    """Show students who failed per subject. Backfills missing names from df and DB."""
+    """Show students who failed per subject. Backfills missing student & teacher names."""
     st.subheader("Failed Students (by Subject)")
     st.caption("Includes teacher, section, and term info based on current filters.")
     if df.empty:
@@ -390,9 +504,9 @@ def render_failed_students_by_subject(df: pd.DataFrame, passing: float = 75.0) -
         st.success("No failing records in the current scope.")
         return
 
-    # --- Back-fill missing student_name ---
-
-    # 1) Use any names that already exist in the (filtered) dataframe
+    # ---------------------------
+    # Back-fill missing student_name
+    # ---------------------------
     if {"student_no", "student_name"}.issubset(d.columns):
         names_from_df = (
             d[["student_no", "student_name"]]
@@ -404,25 +518,23 @@ def render_failed_students_by_subject(df: pd.DataFrame, passing: float = 75.0) -
             fails["student_no"].map(names_from_df)
         )
 
-    # 2) For remaining blanks, query enrollments once and map by student_no
-    still_missing = (
+    still_missing_students = (
         fails.loc[fails["student_name"].isna(), "student_no"]
         .dropna()
         .unique()
         .tolist()
     )
-    if still_missing:
+    if still_missing_students:
         lookup = {}
         try:
             cur = col("enrollments").find(
-                {"student.student_no": {"$in": still_missing}},
+                {"student.student_no": {"$in": still_missing_students}},
                 {"student.student_no": 1, "student.name": 1, "_id": 0},
             )
             for r in cur:
                 s = r.get("student", {})
                 sno = s.get("student_no")
                 nm = s.get("name")
-                # keep the first non-empty name we see for a student_no
                 if sno and nm and sno not in lookup:
                     lookup[sno] = nm
         except Exception:
@@ -433,7 +545,82 @@ def render_failed_students_by_subject(df: pd.DataFrame, passing: float = 75.0) -
                 fails["student_no"].map(lookup)
             )
 
-    # --- Display ---
+    # ---------------------------
+    # Back-fill missing teacher_name
+    # ---------------------------
+    # Normalize missing teacher_name check
+    def _is_blank(series: pd.Series) -> pd.Series:
+        return series.isna() | (series.astype(str).str.strip() == "")
+
+    # Step 1: use mapping from teacher_email -> teacher_name within current df
+    if {"teacher_email", "teacher_name"}.issubset(d.columns):
+        email_to_name = (
+            d.loc[~_is_blank(d["teacher_email"]) & ~_is_blank(d["teacher_name"]),
+                  ["teacher_email", "teacher_name"]]
+            .drop_duplicates()
+            .set_index("teacher_email")["teacher_name"]
+        )
+        mask_missing_tname = _is_blank(fails["teacher_name"])
+        if not email_to_name.empty and "teacher_email" in fails.columns:
+            fills = fails.loc[mask_missing_tname, "teacher_email"].map(email_to_name)
+            fails.loc[mask_missing_tname, "teacher_name"] = fails.loc[mask_missing_tname, "teacher_name"].fillna(fills)
+
+    # Step 2: most common teacher per (term_label, subject_code, section) from current df
+    for col_needed in ["term_label", "subject_code", "section", "teacher_name"]:
+        if col_needed not in d.columns:
+            d[col_needed] = np.nan
+    known = d.loc[~_is_blank(d["teacher_name"])].copy()
+    if not known.empty:
+        try:
+            # most frequent teacher per key
+            key_cols = ["term_label", "subject_code", "section"]
+            common_map = (
+                known.groupby(key_cols)["teacher_name"]
+                .agg(lambda s: s.value_counts().index[0])
+            )
+            mask_missing_tname = _is_blank(fails["teacher_name"])
+            if mask_missing_tname.any():
+                key_df = fails.loc[mask_missing_tname, key_cols]
+                tuple_keys = list(map(tuple, key_df.values))
+                map_vals = pd.Series(tuple_keys).map(common_map.to_dict())
+                fails.loc[mask_missing_tname, "teacher_name"] = fails.loc[mask_missing_tname, "teacher_name"].fillna(map_vals.values)
+        except Exception:
+            pass
+
+    # Step 3: single DB lookup by missing teacher emails
+    mask_missing_tname = _is_blank(fails["teacher_name"])
+    if mask_missing_tname.any() and "teacher_email" in fails.columns:
+        missing_emails = (
+            fails.loc[mask_missing_tname, "teacher_email"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .unique()
+            .tolist()
+        )
+        if missing_emails:
+            email_lookup = {}
+            try:
+                cur = col("enrollments").find(
+                    {"teacher.email": {"$in": missing_emails}},
+                    {"teacher.email": 1, "teacher.name": 1, "_id": 0},
+                )
+                for r in cur:
+                    t = r.get("teacher", {})
+                    em = t.get("email")
+                    nm = t.get("name")
+                    if em and nm and em not in email_lookup:
+                        email_lookup[em] = nm
+            except Exception:
+                email_lookup = {}
+
+            if email_lookup:
+                fills = fails.loc[mask_missing_tname, "teacher_email"].map(email_lookup)
+                fails.loc[mask_missing_tname, "teacher_name"] = fails.loc[mask_missing_tname, "teacher_name"].fillna(fills)
+
+    # ---------------------------
+    # Display
+    # ---------------------------
     cols = [
         "term_label",
         "school_year",
@@ -854,6 +1041,59 @@ def main():
     if r7 and not gen2:
         render_curriculum_progress_advising()
 
+def render_subject_pass_fail(df: pd.DataFrame) -> None:
+    """Subject pass/fail distribution per subject and term (semester)."""
+    st.subheader("Subject Pass/Fail Distribution")
+    if df.empty:
+        _empty_state("No rows for the current filters.")
+
+    # Work on a copy; consider only numeric grades for pass/fail
+    d = df.copy()
+    d["grade_num"] = pd.to_numeric(d.get("grade"), errors="coerce")
+    d = d[~d["grade_num"].isna()]  # ignore INC/Dropped/etc. for this view
+    if d.empty:
+        st.info("No numeric grades available for pass/fail distribution.")
+        return
+
+    # Pass if grade >= 75
+    d["is_pass"] = d["grade_num"] >= 75
+
+    # Aggregate by subject + term
+    g = (
+        d.groupby(["subject_code", "subject_title", "term_label"], as_index=False)
+         .agg(
+             **{
+                 "Pass Count": ("is_pass", lambda s: int(s.sum())),
+                 "Fail Count": ("is_pass", lambda s: int((~s).sum())),
+             }
+         )
+    )
+    g["Total"]   = g["Pass Count"] + g["Fail Count"]
+    g["Pass %"]  = ((g["Pass Count"] / g["Total"]) * 100).round(0).fillna(0).astype(int)
+    g["Fail %"]  = ((g["Fail Count"] / g["Total"]) * 100).round(0).fillna(0).astype(int)
+
+    # Pretty rename/ordering to match your sample
+    out = g.rename(
+        columns={
+            "subject_code": "Subject Code",
+            "subject_title": "Subject Name",
+            "term_label": "Semester",
+        }
+    )[
+        ["Subject Code", "Subject Name", "Semester", "Pass Count", "Fail Count", "Pass %", "Fail %"]
+    ]
+
+    # Sort by semester then subject code (semester uses your term sort helper)
+    out = out.sort_values(
+        by=["Semester", "Subject Code"],
+        key=lambda s: _sort_key_for_series_of_term_labels(s) if s.name == "Semester" else s,
+    )
+
+    # Render percent columns with % sign (purely cosmetic)
+    out["Pass %"] = out["Pass %"].astype(str) + "%"
+    out["Fail %"] = out["Fail %"].astype(str) + "%"
+
+    st.dataframe(out, use_container_width=True)
 
 if __name__ == "__main__":
     main()
