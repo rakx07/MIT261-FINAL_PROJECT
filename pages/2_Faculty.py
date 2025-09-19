@@ -11,8 +11,6 @@ import streamlit as st
 from db import col
 from utils.auth import require_role, current_user
 
-from utils.auth import current_user  # already available in your auth helpers
-
 
 def _user_header(u: dict | None):
     if not u:
@@ -35,7 +33,6 @@ def _user_header(u: dict | None):
         """,
         unsafe_allow_html=True,
     )
-
 
 # ──────────────────────────────────────────
 # Helpers
@@ -187,13 +184,7 @@ def main():
 
     st.title("🏫 Faculty Dashboard")
     st.caption("Teacher scope applies automatically for faculty. Registrars/Admins can filter by teacher.")
-    # show who is signed in
-    try:
-        u = user  # if you used require_role(...) and stored it as `user`
-    except NameError:
-        from utils.auth import get_current_user  # if you already use this helper on this page
-        u = get_current_user() or current_user()
-    _user_header(u)
+    _user_header(user)
 
     teacher_email: Optional[str] = None
     teachers = list_teacher_emails()
@@ -242,7 +233,6 @@ def main():
     # Faculty Name field – show selected teacher if registrar/admin (FIX)
     faculty_display_name = user.get("name") or ""
     if role in ("registrar", "admin") and teacher_email:
-        # lookup name from teachers list
         match = next((nm for nm, em in teachers if em == teacher_email), None)
         if match:
             faculty_display_name = match
@@ -272,7 +262,7 @@ def main():
         tmp["bin"] = pd.cut(tmp["grade"], bins=bins, labels=labels, right=True, include_lowest=True)
 
         counts = (
-            tmp.groupby(["Course Code", "Course Name", "bin"])
+            tmp.groupby(["Course Code", "Course Name", "bin"], observed=False)  # silence FutureWarning
                .size()
                .unstack(fill_value=0)
         )
@@ -284,7 +274,6 @@ def main():
         counts = counts[labels]
         totals = counts.sum(axis=1)
         pct = (counts.div(totals.replace(0, 1), axis=0) * 100).round(0).astype("Int64").astype(str) + "%"
-
         pct["Total"] = totals.values
         pct = pct.reset_index()
 
@@ -299,12 +288,10 @@ def main():
         hist_counts = pd.cut(
             graded["grade"], bins=hist_bins, right=True, include_lowest=True
         ).value_counts().sort_index()
-        chart_df = pd.DataFrame(
-            {"Range": hist_counts.index.astype(str), "Count": hist_counts.values}
-        ).set_index("Range")
+        chart_df = pd.DataFrame({"Range": hist_counts.index.astype(str), "Count": hist_counts.values}).set_index("Range")
         st.bar_chart(chart_df)
 
-    # 2) Student Progress Tracker  (REPLACED your old "Avg by term")
+    # 2) Student Progress Tracker
     st.subheader("2) Student Progress Tracker")
     st.caption("Shows longitudinal performance for individual students. Filtered by Subject or Course or YearLevel.")
 
@@ -414,7 +401,7 @@ def main():
             )
             st.dataframe(show, use_container_width=True, height=min(520, 35 + 28 * len(show)))
 
-    # 5) Grade Submission Status (keep ungraded)
+    # 5) Grade Submission Status
     st.subheader("5) Grade Submission Status")
     if df.empty:
         st.info("No enrollments to summarize.")
@@ -438,6 +425,101 @@ def main():
         )
         st.dataframe(status, use_container_width=True)
 
+    # 6) Custom Query Builder
+    st.subheader("6) Custom Query Builder")
+    st.caption("Allows users to build filtered queries (e.g., “Show all students with < 75 in CS101”).")
+
+    df_safe = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    if df_safe.empty and 'teacher_email' not in locals():
+        st.info("No enrollments to query.")
+    else:
+        # Use FULL (unfiltered) scope for option lists so all terms/subjects appear
+        try:
+            df_all = load_enrollments_df(teacher_email)
+        except Exception:
+            df_all = df_safe.copy()
+
+        subj_opts = sorted(df_all.get("subject_code", pd.Series(dtype=str)).dropna().unique().tolist())
+        term_opts = sorted(df_all.get("term_label", pd.Series(dtype=str)).dropna().unique().tolist(), key=_term_sort_key)
+        prog_opts = sorted(df_all.get("program_code", pd.Series(dtype=str)).dropna().unique().tolist())
+
+        cqb1, cqb2, cqb3, cqb4 = st.columns([1, 1, 1, 1])
+        with cqb1:
+            cq_subject = st.selectbox("Course Code", options=["(any)"] + subj_opts, key="cq_subject")
+        with cqb2:
+            cq_op = st.selectbox("Grade Operator", ["<", "<=", "==", ">=", ">", "between"], key="cq_op")
+        with cqb3:
+            cq_val1 = st.number_input("Value", min_value=0.0, max_value=100.0, value=75.0, step=1.0, key="cq_val1")
+        with cqb4:
+            cq_val2 = None
+            if cq_op == "between":
+                cq_val2 = st.number_input("and", min_value=0.0, max_value=100.0, value=85.0, step=1.0, key="cq_val2")
+
+        cqb5, cqb6 = st.columns(2)
+        with cqb5:
+            cq_terms = st.multiselect("Term(s) (optional)", options=term_opts, key="cq_terms")
+        with cqb6:
+            cq_progs = st.multiselect("Program(s) (optional)", options=prog_opts, key="cq_progs")
+
+        run_query = st.button("Run Query", type="primary", key="cq_run")
+
+        # Pretty example line
+        if cq_subject != "(any)":
+            if cq_op == "between" and cq_val2 is not None:
+                example_txt = f"Show all students with {cq_val1:.0f} ≤ grade ≤ {cq_val2:.0f} in {cq_subject}"
+            else:
+                example_txt = f"Show all students with {cq_op} {cq_val1:.0f} in {cq_subject}"
+        else:
+            if cq_op == "between" and cq_val2 is not None:
+                example_txt = f"Show all students with {cq_val1:.0f} ≤ grade ≤ {cq_val2:.0f}"
+            else:
+                example_txt = f"Show all students with grade {cq_op} {cq_val1:.0f}"
+        st.markdown(f"*Query Example:* _{example_txt}_")
+
+        if run_query:
+            q = df_safe.copy()
+            if "grade" not in q.columns:
+                st.info("No grade column to query.")
+            else:
+                q = q.dropna(subset=["grade"])
+
+                if cq_subject != "(any)" and "subject_code" in q.columns:
+                    q = q[q["subject_code"] == cq_subject]
+                if cq_terms and "term_label" in q.columns:
+                    q = q[q["term_label"].isin(cq_terms)]
+                if cq_progs and "program_code" in q.columns:
+                    q = q[q["program_code"].isin(cq_progs)]
+
+                if cq_op == "<":
+                    q = q[q["grade"] < cq_val1]
+                elif cq_op == "<=":
+                    q = q[q["grade"] <= cq_val1]
+                elif cq_op == "==":
+                    q = q[q["grade"] == cq_val1]
+                elif cq_op == ">=":
+                    q = q[q["grade"] >= cq_val1]
+                elif cq_op == ">":
+                    q = q[q["grade"] > cq_val1]
+                elif cq_op == "between" and cq_val2 is not None:
+                    lo, hi = (cq_val1, cq_val2) if cq_val1 <= cq_val2 else (cq_val2, cq_val1)
+                    q = q[(q["grade"] >= lo) & (q["grade"] <= hi)]
+
+                cols_out = ["student_no", "student_name", "subject_code", "subject_title", "grade"]
+                cols_out = [c for c in cols_out if c in q.columns]
+                res = (
+                    q[cols_out]
+                    .rename(columns={
+                        "student_no": "Student ID",
+                        "student_name": "Name",
+                        "subject_code": "Course Code",
+                        "subject_title": "Course Name",
+                        "grade": "Grade",
+                    })
+                    .sort_values(["Course Code", "Name"], na_position="last")
+                )
+
+                st.dataframe(res, use_container_width=True, hide_index=True)
+                st.caption(f"{len(res)} result(s)")
 
 if __name__ == "__main__":
     main()
