@@ -270,6 +270,7 @@ with tabs[4]:
 
     st.markdown("---")
 
+
     # ---- Bulk temp password reset
     picks = edited[edited["select"]]["email"].tolist()
     r1, r2, r3 = st.columns([1, 1, 2])
@@ -307,3 +308,4 @@ with tabs[4]:
         )
 
     st.caption("Note: existing passwords are never shown anywhere. Only newly created or newly issued temp passwords appear here.")
+                                                                                                                                                                                                                                                                                                                                                                           
