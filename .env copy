@@ -1,0 +1,3 @@
+MONGODB_URI=mongodb+srv://mit-261-main:6HTQ8eXnfumHuASF@cluster0.1vudeiq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0
+DB_NAME=mit261
+APP_SECRET=some-long-random-string
