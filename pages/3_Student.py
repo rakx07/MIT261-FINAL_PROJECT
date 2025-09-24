@@ -540,9 +540,8 @@ def main():
         chart_df = tbl.set_index("Semester")
         st.line_chart(chart_df)
 
-        
     # ----------------------------
-    # 3. Subject Difficulty Ratings  (scoped to student's section & term)
+    # 3. Subject Difficulty Ratings  (scoped to student's own section & term per subject)
     # ----------------------------
     st.subheader("3. Subject Difficulty Ratings")
     st.caption("Shows where the student’s grade sits relative to classmates by subject (same section & same term).")
@@ -550,14 +549,15 @@ def main():
     if df.empty:
         st.info("No data for difficulty ratings.")
     else:
-        # Student’s latest record per subject (grade + section + term)
-        stu_grades = df.dropna(subset=["grade"]).copy()
-        if stu_grades.empty:
-            st.info("No student grades to compare.")
+        # --- Student’s latest enrollment per subject (even if no grade yet) ---
+        stu_enr = df.copy()
+        if stu_enr.empty:
+            st.info("No student enrollments to compare.")
         else:
-            stu_grades["sortkey"] = stu_grades["term_label"].map(_term_sort_key)
+            stu_enr["sortkey"] = stu_enr["term_label"].map(_term_sort_key)
+            # keep the latest record per subject for the student
             stu_latest = (
-                stu_grades.sort_values("sortkey")
+                stu_enr.sort_values("sortkey")
                 .groupby("subject_code", as_index=False)
                 .tail(1)[["subject_code", "subject_title", "grade", "section", "term_label"]]
                 .rename(columns={
@@ -567,11 +567,17 @@ def main():
                 })
             )
 
-            # Class population: restrict strictly to the student's same section & term per subject
-            pop = df_scope.dropna(subset=["grade"]).copy()
-            if pop.empty or stu_latest.empty:
-                st.info("No class population grades available for the student's section/term.")
+            # Limit to subjects that pass the current top filters (df_scope already honors filters)
+            scoped_subjects = set(df_scope["subject_code"].dropna().unique().tolist())
+            stu_latest = stu_latest[stu_latest["subject_code"].isin(scoped_subjects)]
+
+            if stu_latest.empty:
+                st.info("No student subjects match the current filters.")
             else:
+                # --- Class population restricted to the student's same section & term for each subject ---
+                pop = df_scope.dropna(subset=["grade"]).copy()
+
+                # Merge to know, for each row in the population, which section/term to match for that subject
                 pop_match = pop.merge(
                     stu_latest[["subject_code", "stu_section", "stu_term"]],
                     on="subject_code",
@@ -582,10 +588,13 @@ def main():
                     (pop_match["term_label"] == pop_match["stu_term"])
                 ]
 
+                # If there are no classmates for some subject, we still want that subject to appear with zeros.
+                # Build counts & totals only from what exists; we'll outer-merge with student subjects later.
                 if pop_match.empty:
-                    st.info("No classmates found in the same section/term for these subjects.")
+                    counts = pd.DataFrame(columns=["subject_code", "subject_title", "bucket", "n"])
+                    totals = pd.DataFrame(columns=["subject_code", "subject_title", "Total Students"])
                 else:
-                    # Bucketize grades
+                    # Bucketize population grades
                     def _bucket(v: float) -> str:
                         try:
                             g = float(v)
@@ -599,7 +608,6 @@ def main():
 
                     pop_match["bucket"] = pop_match["grade"].map(_bucket)
 
-                    # Counts per subject/bucket and totals
                     counts = (
                         pop_match.groupby(["subject_code", "subject_title", "bucket"], dropna=False)
                         .size()
@@ -611,7 +619,10 @@ def main():
                         .reset_index(name="Total Students")
                     )
 
-                    # Pivot to percentage columns
+                # Pivot counts → percent columns
+                if counts.empty:
+                    pivot = pd.DataFrame(columns=["subject_code", "subject_title"])
+                else:
                     pivot = counts.pivot_table(
                         index=["subject_code", "subject_title"],
                         columns="bucket",
@@ -620,125 +631,164 @@ def main():
                         aggfunc="sum",
                     ).reset_index()
 
-                    for colname in ["90–100 (%)", "80–89 (%)", "70–79 (%)", "60–69 (%)", "< 60 (%)"]:
-                        if colname not in pivot.columns:
-                            pivot[colname] = 0
+                # Ensure all expected percentage columns exist
+                pct_cols = ["90–100 (%)", "80–89 (%)", "70–79 (%)", "60–69 (%)", "< 60 (%)"]
+                for colname in pct_cols:
+                    if colname not in pivot.columns:
+                        pivot[colname] = 0
 
-                    ratings = pivot.merge(totals, on=["subject_code", "subject_title"], how="left")
-                    for colname in ["90–100 (%)", "80–89 (%)", "70–79 (%)", "60–69 (%)", "< 60 (%)"]:
-                        ratings[colname] = ((ratings[colname] / ratings["Total Students"]) * 100).round(0).astype("Int64")
+                # Attach totals; outer-merge with student's subjects to keep ALL subjects in the filtered scope
+                ratings = pivot.merge(totals, on=["subject_code", "subject_title"], how="left")
+                ratings = stu_latest.merge(ratings, on=["subject_code", "subject_title"], how="left")
 
-                    # Attach student's own grade (latest per subject)
-                    ratings = ratings.merge(stu_latest[["subject_code", "Your Grade (%)"]], on="subject_code", how="left")
+                # Fill NA totals and counts with zeros for subjects with no classmates found
+                ratings["Total Students"] = ratings["Total Students"].fillna(0).astype(int)
+                for colname in pct_cols:
+                    ratings[colname] = ratings[colname].fillna(0)
 
-                    # Difficulty rule (based on share of "< 60 (%)")
-                    def _difficulty(row):
-                        lt60 = int(row.get("< 60 (%)") or 0)
-                        if lt60 >= 20:
-                            return "High"
-                        if lt60 >= 10:
-                            return "Medium"
-                        return "Low"
+                # Convert counts → percentages
+                # Avoid division by zero; when Total Students == 0, keep 0%
+                for colname in pct_cols:
+                    ratings[colname] = np.where(
+                        ratings["Total Students"] > 0,
+                        (ratings[colname] / ratings["Total Students"] * 100).round(0),
+                        0,
+                    ).astype(int)  # FIX: avoid pandas nullable "Int64" dtype
 
-                    ratings["Difficulty Level"] = ratings.apply(_difficulty, axis=1)
+                # Difficulty rule (based on share of "< 60 (%)")
+                def _difficulty(row):
+                    lt60 = int(row.get("< 60 (%)") or 0)
+                    if lt60 >= 20:
+                        return "High"
+                    if lt60 >= 10:
+                        return "Medium"
+                    return "Low"
 
-                    # Final display
-                    show = ratings.rename(columns={
-                        "subject_code": "Course Code",
-                        "subject_title": "Course Name",
-                    })[
-                        ["Course Code", "Course Name", "Total Students", "Your Grade (%)",
-                        "90–100 (%)", "80–89 (%)", "70–79 (%)", "60–69 (%)", "< 60 (%)",
-                        "Difficulty Level"]
-                    ]
+                ratings["Difficulty Level"] = ratings.apply(_difficulty, axis=1)
 
-                    # Order High → Medium → Low, then by "< 60 (%)" desc
-                    lvl_order = pd.CategoricalDtype(categories=["High", "Medium", "Low"], ordered=True)
-                    show["Difficulty Level"] = show["Difficulty Level"].astype(lvl_order)
-                    show = show.sort_values(["Difficulty Level", "< 60 (%)"], ascending=[True, False]).reset_index(drop=True)
+                # Final display (1 row per subject; each one is the student's own section for that subject)
+                show = ratings.rename(columns={
+                    "subject_code": "Course Code",
+                    "subject_title": "Course Name",
+                })[
+                    ["Course Code", "Course Name", "Total Students", "Your Grade (%)"] + pct_cols + ["Difficulty Level"]
+                ]
 
-                    # Student header line like your mockup
-                    header_left = (df["student_no"].dropna().iloc[0] if not df["student_no"].dropna().empty else "—")
-                    header_right = (df["student_name"].dropna().iloc[0] if not df["student_name"].dropna().empty else "—")
-                    st.markdown(f"**Student:** {header_left} – {header_right}")
+                # Order High → Medium → Low, then by "< 60 (%)" desc
+                lvl_order = pd.CategoricalDtype(categories=["High", "Medium", "Low"], ordered=True)
+                show["Difficulty Level"] = show["Difficulty Level"].astype(lvl_order)
+                show = show.sort_values(["Difficulty Level", "< 60 (%)"], ascending=[True, False]).reset_index(drop=True)
 
-                    st.dataframe(show, use_container_width=True)
+                # Student header line like your mockup
+                header_left = (df["student_no"].dropna().iloc[0] if not df["student_no"].dropna().empty else "—")
+                header_right = (df["student_name"].dropna().iloc[0] if not df["student_name"].dropna().empty else "—")
+                st.markdown(f"**Student:** {header_left} – {header_right}")
 
+                st.dataframe(show, use_container_width=True)
 
     # ----------------------------
-    # 4. Comparison with Class Average
+    # 4. Comparison with Class Average  (scoped to student's section & term per subject)
     # ----------------------------
     st.subheader("4. Comparison with Class Average")
 
     if graded.empty:
         st.info("No graded entries available for comparison.")
     else:
-        # Student’s latest record per subject (grade + section + term)
-        stu_grades = graded.dropna(subset=["grade"]).copy()
-        stu_grades["sortkey"] = stu_grades["term_label"].map(_term_sort_key)
-        stu_latest = (
-            stu_grades.sort_values("sortkey")
-            .groupby("subject_code", as_index=False)
-            .tail(1)[["subject_code", "subject_title", "grade", "section", "term_label"]]
-            .rename(columns={
-                "grade": "Your Grade (%)",
-                "section": "stu_section",
-                "term_label": "stu_term",
-            })
-        )
-
-        # Class population: restrict strictly to the student's same section & term per subject
-        pop = df_scope.dropna(subset=["grade"]).copy()
-        if pop.empty or stu_latest.empty:
-            st.info("No class population grades available for the student's section/term.")
+        # --- Student’s latest enrollment per subject (even if no grade yet) ---
+        stu_enr = df.copy()
+        if stu_enr.empty:
+            st.info("No student enrollments to compare.")
         else:
-            # Join to get, for each subject, the student's section & term to filter classmates
-            pop_match = pop.merge(
-                stu_latest[["subject_code", "stu_section", "stu_term"]],
-                on="subject_code",
-                how="inner",
+            stu_enr["sortkey"] = stu_enr["term_label"].map(_term_sort_key)
+            stu_latest = (
+                stu_enr.sort_values("sortkey")
+                .groupby("subject_code", as_index=False)
+                .tail(1)[["subject_code", "subject_title", "grade", "section", "term_label"]]
+                .rename(columns={
+                    "grade": "Your Grade (%)",
+                    "section": "stu_section",
+                    "term_label": "stu_term",
+                })
             )
 
-            # Keep only rows in the same section and same term as the student's latest record for that subject
-            pop_match = pop_match[
-                (pop_match["section"] == pop_match["stu_section"]) &
-                (pop_match["term_label"] == pop_match["stu_term"])
-            ]
+            # Keep only subjects that are in the current filtered scope
+            scoped_subjects = set(df_scope["subject_code"].dropna().unique().tolist())
+            stu_latest = stu_latest[stu_latest["subject_code"].isin(scoped_subjects)]
 
-            if pop_match.empty:
-                st.info("No classmates found in the same section/term for comparison.")
+            if stu_latest.empty:
+                st.info("No student subjects match the current filters.")
             else:
-                # Class average & ranking per subject (within student's section & term)
-                stats = (
-                    pop_match.groupby(["subject_code", "subject_title"], dropna=False)["grade"]
-                    .agg(["mean", "count", list])
-                    .reset_index()
-                )
-                stats = stats.rename(columns={"mean": "Class Average (%)", "count": "Total Students"})
+                # --- Class population restricted to student's same section & term for each subject ---
+                pop = df_scope.dropna(subset=["grade"]).copy()
 
-                # Merge with student's own grade (latest per subject)
-                merged = stats.merge(
-                    stu_latest[["subject_code", "subject_title", "Your Grade (%)"]],
+                pop_match = pop.merge(
+                    stu_latest[["subject_code", "stu_section", "stu_term"]],
+                    on="subject_code",
+                    how="inner",
+                )
+                pop_match = pop_match[
+                    (pop_match["section"] == pop_match["stu_section"]) &
+                    (pop_match["term_label"] == pop_match["stu_term"])
+                ]
+
+                # Build stats from classmates; keep student's subjects even if no classmates exist
+                if pop_match.empty:
+                    stats = pd.DataFrame(
+                        columns=[
+                            "subject_code", "subject_title",
+                            "Class Average (%)", "Total Students", "grades_list"
+                        ]
+                    )
+                else:
+                    # Use explicit named aggregations to avoid "list" confusion
+                    stats = (
+                        pop_match.groupby(["subject_code", "subject_title"], dropna=False)
+                        .agg(
+                            **{
+                                "Class Average (%)": ("grade", "mean"),
+                                "Total Students": ("grade", "count"),
+                                "grades_list": ("grade", list),
+                            }
+                        )
+                        .reset_index()
+                    )
+
+                # Outer-merge with student's subjects so every filtered subject appears once
+                merged = stu_latest.merge(
+                    stats,
                     on=["subject_code", "subject_title"],
                     how="left",
                 )
 
-                # Rank calculation (within filtered classmates list)
+                # Robust ranking within classmates for that subject/section/term
                 def _rank(row):
-                    grades = sorted(row["list"], reverse=True)
-                    yg = row["Your Grade (%)"]
+                    grades = row.get("grades_list", None)
+                    yg = row.get("Your Grade (%)")
+                    # If we don't have a list of grades or student's grade is missing, skip
+                    if not isinstance(grades, (list, tuple, np.ndarray)) or pd.isna(yg) or len(grades) == 0:
+                        return "—"
+                    # Ensure numeric + sorted desc
                     try:
-                        pos = grades.index(yg) + 1
+                        grades_sorted = sorted([float(g) for g in grades], reverse=True)
+                    except Exception:
+                        return "—"
+                    # If the student's grade isn't in the list (e.g., not included in pop_match), include for position
+                    if float(yg) not in grades_sorted:
+                        grades_sorted.append(float(yg))
+                        grades_sorted = sorted(grades_sorted, reverse=True)
+                    # Rank is 1-based index of the first occurrence
+                    try:
+                        pos = grades_sorted.index(float(yg)) + 1
                     except ValueError:
-                        pos = None
-                    return f"{pos} of {len(grades)}" if pos else "—"
+                        return "—"
+                    return f"{pos} of {len(grades)}"
 
                 merged["Your Rank"] = merged.apply(_rank, axis=1)
 
-                # Remarks
+                # Remarks vs class average
                 def _remark(row):
-                    yg = row["Your Grade (%)"]
-                    ca = row["Class Average (%)"]
+                    yg = row.get("Your Grade (%)")
+                    ca = row.get("Class Average (%)")
                     if pd.isna(yg) or pd.isna(ca):
                         return "—"
                     if yg > ca + 5:
@@ -750,20 +800,21 @@ def main():
 
                 merged["Remark"] = merged.apply(_remark, axis=1)
 
-                # Round percentages
+                # Clean up fields
+                merged["Total Students"] = merged["Total Students"].fillna(0).astype(int)
                 merged["Your Grade (%)"] = merged["Your Grade (%)"].round(0)
                 merged["Class Average (%)"] = merged["Class Average (%)"].round(0)
 
-                # Final table
+                # Final table (exactly one row per filtered subject)
                 show = merged.rename(columns={
                     "subject_code": "Course Code",
                     "subject_title": "Course Name",
                 })[
                     ["Course Code", "Course Name", "Total Students", "Your Grade (%)",
                     "Class Average (%)", "Your Rank", "Remark"]
-                ]
+                ].reset_index(drop=True)
 
-                # Student header line like screenshot
+                # Student header like the mockup
                 header_left = (df["student_no"].dropna().iloc[0] if not df["student_no"].dropna().empty else "—")
                 header_right = (df["student_name"].dropna().iloc[0] if not df["student_name"].dropna().empty else "—")
                 st.markdown(f"**Student:** {header_left} – {header_right}")
@@ -775,34 +826,123 @@ def main():
                     unsafe_allow_html=True,
                 )
 
+    # ----------------------------
+    # 5. Passed vs Failed Summary
+    # ----------------------------
+    st.subheader("5. Passed vs Failed Summary")
 
-    # ----------------------------
-    # 5) Grade Submission Status
-    # ----------------------------
-    st.subheader("5) Grade Submission Status")
+    # Helper: try to fetch the student's required-subject list from curriculum-like collections.
+    def _required_subject_codes_for_program(program_code: str | None) -> list[str]:
+        if not program_code:
+            return []
+        candidates = ["curriculum", "curricula", "program_curricula", "prospectus", "curriculums"]
+        best: list[str] = []
+        for cname in candidates:
+            try:
+                c = col(cname)
+            except Exception:
+                continue
+            try:
+                for doc in c.find({}, {"subjects": 1, "program": 1, "program_code": 1, "programCode": 1, "title": 1}):
+                    # Match by program_code if present
+                    doc_prog = None
+                    if isinstance(doc.get("program"), dict):
+                        doc_prog = doc["program"].get("program_code") or doc["program"].get("code")
+                    doc_prog = doc_prog or doc.get("program_code") or doc.get("programCode")
+                    if isinstance(doc_prog, str) and doc_prog.strip().lower() != str(program_code).strip().lower():
+                        continue
+
+                    subs = doc.get("subjects") or []
+                    codes = []
+                    if isinstance(subs, list):
+                        for s in subs:
+                            code = (s.get("subjectCode") or s.get("code") or s.get("subject_code") or "").strip()
+                            if code:
+                                codes.append(code)
+                    if len(codes) > len(best):
+                        best = list(dict.fromkeys(codes))  # unique preserve order
+            except Exception:
+                # ignore malformed docs
+                pass
+        return best
+
     df_status = df.copy()
     if df_status.empty:
         st.info("No enrollments to summarize.")
     else:
-        status = (
-            df_status.groupby("subject_code")
-            .agg(
-                total=("grade", "size"),
-                graded_cnt=("grade", lambda s: s.notna().sum()),
-            )
-            .reset_index()
+        # Student identity line (like the mockup)
+        header_left = (df["student_no"].dropna().iloc[0] if not df["student_no"].dropna().empty else "—")
+        header_right = (df["student_name"].dropna().iloc[0] if not df["student_name"].dropna().empty else "—")
+        st.markdown(f"**Student:** {header_left} – {header_right}")
+
+        # Determine the set of "required" subjects from curriculum if available (by student's program)
+        stu_program = df["program_code"].dropna().iloc[0] if not df["program_code"].dropna().empty else None
+        required_codes = _required_subject_codes_for_program(stu_program)
+
+        # Use the student's latest record per subject (so we count each subject once)
+        df_tmp = df.copy()
+        df_tmp["sortkey"] = df_tmp["term_label"].map(_term_sort_key)
+        latest = (
+            df_tmp.sort_values("sortkey")
+            .groupby("subject_code", as_index=False)
+            .tail(1)[["subject_code", "grade"]]
         )
-        status["completion_%"] = (status["graded_cnt"] / status["total"] * 100).round(1)
-        status = status.sort_values(["completion_%", "subject_code"], ascending=[True, True])
-        status = status.rename(
-            columns={
-                "subject_code": "Subject",
-                "total": "Total Enrollments",
-                "graded_cnt": "Graded Count",
-                "completion_%": "Completion %",
-            }
+
+        # Passed / Failed counted by latest numeric grade
+        gnum = pd.to_numeric(latest["grade"], errors="coerce")
+        latest = latest.assign(_g=gnum)
+
+        passed_cnt = int((latest["_g"] >= PASSING_GRADE).sum())
+        failed_cnt = int((latest["_g"] < PASSING_GRADE).sum())
+
+        # Total required subjects & "Not Yet Taken"
+        if required_codes:
+            total_required = len(required_codes)
+            taken_subjects = set(latest.loc[latest["_g"].notna(), "subject_code"].dropna().tolist())
+            notyet_cnt = max(total_required - len(taken_subjects), 0)
+            header_note = f"(out of {total_required} required subjects)"
+        else:
+            # Fallback: we only know about the subjects the student has in the system
+            total_required = int(latest["subject_code"].nunique())
+            notyet_cnt = 0
+            header_note = f"(out of {total_required} tracked subjects)"
+
+        st.markdown(f"**Subject Completion Overview {header_note}**")
+
+        # Build table
+        def _pct(n: int, d: int) -> float:
+            return round((n / d) * 100, 1) if d > 0 else 0.0
+
+        rows = [
+            ["Passed Subjects", passed_cnt, _pct(passed_cnt, total_required), "Courses where the student achieved passing grades"],
+            ["Failed Subjects", failed_cnt, _pct(failed_cnt, total_required), "Courses where the student earned failing grades"],
+            ["Not Yet Taken", notyet_cnt, _pct(notyet_cnt, total_required), "Remaining required courses yet to be taken"],
+            ["Total Required Subjects", total_required, 100.0 if total_required > 0 else 0.0, "Total courses in the curriculum"],
+        ]
+        out_df = pd.DataFrame(rows, columns=["Category", "Count", "Percentage (%)", "Description"])
+        st.dataframe(out_df, use_container_width=True)
+
+        st.markdown(
+            "<strong>Description:</strong> A simple summary of academic outcomes—ideal for pie or bar chart depiction.",
+            unsafe_allow_html=True,
         )
-        st.dataframe(status, use_container_width=True)
+        st.markdown("_Followed by pie chart._")
+
+        # Pie chart (smaller size)
+        try:
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(4, 4))   # <-- smaller size
+            labels = ["Passed", "Failed", "Not Yet Taken"]
+            sizes = [passed_cnt, failed_cnt, notyet_cnt]
+            # Avoid all zeros (matplotlib error)
+            if sum(sizes) == 0:
+                sizes = [1, 1, 1]
+            ax.pie(sizes, labels=labels, autopct="%1.0f%%", startangle=90, textprops={"fontsize": 8})
+            ax.axis("equal")
+            st.pyplot(fig)
+        except Exception:
+            st.caption("Chart rendering unavailable in this environment.")
+
 
     # ----------------------------
     # 6) Prospectus / Curriculum Evaluation
