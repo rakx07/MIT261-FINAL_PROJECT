@@ -294,64 +294,147 @@ def main():
     st.subheader("2) Student Progress Tracker")
     st.caption("Shows longitudinal performance for individual students. Filtered by Subject or Course or YearLevel.")
 
-    if graded.empty:
-        st.info("No data available for student progress.")
+    # Use the page-scope dataset (already limited by teacher/term/section) as the base.
+    base_df = df_scope.copy() if "df_scope" in locals() else df.copy()
+
+    if base_df.empty:
+        st.info("No data available for student progress in the current page filters.")
     else:
-        g = graded.copy()
-        g["gpa"] = (g["grade"].astype(float) / 100.0 * 4.0).clip(0, 4).round(2)
+        # Normalize common fields
+        if "subject_code" in base_df.columns:
+            base_df["subject_code"] = base_df["subject_code"].astype(str).str.strip().str.upper()
+        if "program_code" in base_df.columns:
+            base_df["program_code"] = base_df["program_code"].astype(str).str.strip()
 
-        # Choose columns (prefer selected terms; else last 3)
-        terms_order = sel_terms if sel_terms else \
-            sorted(g["term_label"].dropna().unique().tolist(), key=_term_sort_key)
-        if len(terms_order) > 3:
-            terms_order = terms_order[-3:]
+        # Local, section-specific filters (optional). If left empty, we inherit the page's top filters.
+        lf1, lf2, lf3 = st.columns(3)
+        with lf1:
+            sec2_subjects = st.multiselect(
+                "Filter (Subject / Course Code)",
+                options=sorted(base_df["subject_code"].dropna().unique().tolist()),
+                help="Optional; leave blank to keep the current page filters."
+            )
+        with lf2:
+            sec2_programs = st.multiselect(
+                "Filter (Program / Course)",
+                options=sorted(base_df["program_code"].dropna().unique().tolist()) if "program_code" in base_df.columns else [],
+                help="Optional; leave blank to keep the current page filters."
+            )
+        # Year level may or may not exist in your schema; detect common field names
+        ycol = "year_level" if "year_level" in base_df.columns else ("yearlevel" if "yearlevel" in base_df.columns else None)
+        with lf3:
+            sec2_yearlevels = st.multiselect(
+                "Filter (Year Level)",
+                options=sorted(base_df[ycol].dropna().unique().tolist()) if ycol else [],
+                help="Optional; ignored if the dataset has no year level field."
+            )
 
-        pivot = (
-            g[g["term_label"].isin(terms_order)]
-            .groupby(["student_no", "student_name", "term_label"], observed=False)["gpa"]
-            .mean()
-            .reset_index()
-            .pivot_table(index=["student_no", "student_name"], columns="term_label", values="gpa", aggfunc="mean")
-            .reindex(columns=terms_order)
+        # Apply OPTIONAL local filters on top of the page filters.
+        g = base_df.copy()
+        before = len(g)
+
+        if sec2_subjects:
+            # normalize selection, too
+            sel_upper = [str(s).strip().upper() for s in sec2_subjects]
+            g = g[g["subject_code"].isin(sel_upper)]
+        after_subj = len(g)
+
+        if sec2_programs and "program_code" in g.columns:
+            g = g[g["program_code"].isin(sec2_programs)]
+        after_prog = len(g)
+
+        if sec2_yearlevels and ycol:
+            g = g[g[ycol].isin(sec2_yearlevels)]
+        after_year = len(g)
+
+        # Small diagnostics so you can see what's filtering everything out
+        st.caption(
+            f"Rows after page filters: **{before}** · "
+            f"after Subject filter: **{after_subj}** · "
+            f"after Program filter: **{after_prog}** · "
+            f"after Year Level filter: **{after_year}**"
         )
 
-        def trend_text(row):
-            vals = [v for v in row.tolist() if pd.notnull(v)]
-            if len(vals) < 2:
-                return "—"
-            delta = vals[-1] - vals[0]
-            if delta >= 0.10:
-                return "↑ Improving"
-            if delta <= -0.10:
-                return "↓ Needs Attention"
-            return "→ Stable High"
+        g = g.dropna(subset=["grade"])
+        if g.empty:
+            st.info("No graded rows match the chosen filters. Try removing one of the local filters.")
+        else:
+            # Derive a simple GPA (0–4) from the numeric grade for the tracker visuals
+            g["gpa"] = (pd.to_numeric(g["grade"], errors="coerce") / 100.0 * 4.0).clip(0, 4).round(2)
 
-        trend = pivot.apply(trend_text, axis=1)
-        pivot_display = pivot.copy().round(2)
-        pivot_display.insert(0, "Student ID", [i[0] for i in pivot_display.index])
-        pivot_display.insert(1, "Name", [i[1] for i in pivot_display.index])
-        pivot_display["Overall Trend"] = trend.values
-        pivot_display = pivot_display.reset_index(drop=True)
+            # Choose columns (prefer selected terms; else last 3 chronologically)
+            terms_from_page = sel_terms if "sel_terms" in locals() else None
+            terms_order = terms_from_page if terms_from_page else \
+                sorted(g["term_label"].dropna().unique().tolist(), key=_term_sort_key)
+            if len(terms_order) > 3:
+                terms_order = terms_order[-3:]
 
-        st.dataframe(
-            pivot_display[["Student ID", "Name"] + terms_order + ["Overall Trend"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+            # Wide table: rows = students; columns = selected terms; values = mean GPA per term
+            pivot = (
+                g[g["term_label"].isin(terms_order)]
+                .groupby(["student_no", "student_name", "term_label"], observed=False)["gpa"]
+                .mean()
+                .reset_index()
+                .pivot_table(index=["student_no", "student_name"], columns="term_label", values="gpa", aggfunc="mean")
+                .reindex(columns=terms_order)
+            )
 
-        st.markdown("**Followed by: line graph / scatter chart.**")
-        long_df = (
-            pivot.reset_index()
-                 .melt(id_vars=["student_no", "student_name"], value_vars=terms_order,
-                       var_name="Term", value_name="GPA")
-                 .dropna(subset=["GPA"])
-                 .sort_values(["student_no", "Term"])
-        )
-        chart_wide = (
-            long_df.pivot_table(index="Term", columns="student_name", values="GPA", aggfunc="mean")
-                   .reindex(terms_order)
-        )
-        st.line_chart(chart_wide)
+            # If pivot is empty (e.g., grades exist but not in the last 3 terms), relax to all terms
+            if pivot.empty:
+                all_terms_sorted = sorted(g["term_label"].dropna().unique().tolist(), key=_term_sort_key)
+                pivot = (
+                    g.groupby(["student_no", "student_name", "term_label"], observed=False)["gpa"]
+                    .mean()
+                    .reset_index()
+                    .pivot_table(index=["student_no", "student_name"], columns="term_label", values="gpa", aggfunc="mean")
+                    .reindex(columns=all_terms_sorted)
+                )
+                terms_order = all_terms_sorted
+
+            # Trend descriptor ↑ ↓ →
+            def trend_text(row):
+                vals = [v for v in row.tolist() if pd.notnull(v)]
+                if len(vals) < 2:
+                    return "—"
+                delta = vals[-1] - vals[0]
+                if delta >= 0.10:
+                    return "↑ Improving"
+                if delta <= -0.10:
+                    return "↓ Needs Attention"
+                return "→ Stable High"
+
+            trend = pivot.apply(trend_text, axis=1)
+            pivot_display = pivot.copy().round(2)
+            pivot_display.insert(0, "Student ID", [i[0] for i in pivot_display.index])
+            pivot_display.insert(1, "Name", [i[1] for i in pivot_display.index])
+            pivot_display["Overall Trend"] = trend.values
+            pivot_display = pivot_display.reset_index(drop=True)
+
+            st.dataframe(
+                pivot_display[["Student ID", "Name"] + terms_order + ["Overall Trend"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown("**Followed by: line graph / scatter chart.**")
+
+            # Long form → multi-series line (one series per student)
+            long_df = (
+                pivot.reset_index()
+                    .melt(id_vars=["student_no", "student_name"], value_vars=terms_order,
+                        var_name="Term", value_name="GPA")
+                    .dropna(subset=["GPA"])
+                    .sort_values(["student_no", "Term"])
+            )
+            if not long_df.empty:
+                chart_wide = (
+                    long_df.pivot_table(index="Term", columns="student_name", values="GPA", aggfunc="mean")
+                        .reindex(terms_order)
+                )
+                st.line_chart(chart_wide)
+            else:
+                st.caption("No GPA points to chart for the current filters.")
+
 
     # ─────────────────────────────────────
     # 3) Subject Difficulty Heatmap (Fail %)
