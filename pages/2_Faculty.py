@@ -295,7 +295,13 @@ def main():
     st.caption("Shows longitudinal performance for individual students. Filtered by Subject or Course or YearLevel.")
 
     # Use the page-scope dataset (already limited by teacher/term/section) as the base.
-    base_df = df_scope.copy() if "df_scope" in locals() else df.copy()
+    try:
+        base_df = df_scope.copy()  # prefer page-level filtered dataset if available
+    except NameError:
+        try:
+            base_df = df.copy()    # fall back to raw df in this file
+        except NameError:
+            base_df = pd.DataFrame()  # ultimate fallback to avoid NameError during static analysis / runtime
 
     if base_df.empty:
         st.info("No data available for student progress in the current page filters.")
@@ -311,16 +317,17 @@ def main():
         with lf1:
             sec2_subjects = st.multiselect(
                 "Filter (Subject / Course Code)",
-                options=sorted(base_df["subject_code"].dropna().unique().tolist()),
+                options=sorted(base_df["subject_code"].dropna().unique().tolist())
+                        if "subject_code" in base_df.columns else [],
                 help="Optional; leave blank to keep the current page filters."
             )
         with lf2:
             sec2_programs = st.multiselect(
                 "Filter (Program / Course)",
-                options=sorted(base_df["program_code"].dropna().unique().tolist()) if "program_code" in base_df.columns else [],
+                options=sorted(base_df["program_code"].dropna().unique().tolist())
+                        if "program_code" in base_df.columns else [],
                 help="Optional; leave blank to keep the current page filters."
             )
-        # Year level may or may not exist in your schema; detect common field names
         ycol = "year_level" if "year_level" in base_df.columns else ("yearlevel" if "yearlevel" in base_df.columns else None)
         with lf3:
             sec2_yearlevels = st.multiselect(
@@ -333,8 +340,7 @@ def main():
         g = base_df.copy()
         before = len(g)
 
-        if sec2_subjects:
-            # normalize selection, too
+        if sec2_subjects and "subject_code" in g.columns:
             sel_upper = [str(s).strip().upper() for s in sec2_subjects]
             g = g[g["subject_code"].isin(sel_upper)]
         after_subj = len(g)
@@ -343,11 +349,11 @@ def main():
             g = g[g["program_code"].isin(sec2_programs)]
         after_prog = len(g)
 
-        if sec2_yearlevels and ycol:
+        if sec2_yearlevels and ycol and ycol in g.columns:
             g = g[g[ycol].isin(sec2_yearlevels)]
         after_year = len(g)
 
-        # Small diagnostics so you can see what's filtering everything out
+        # Diagnostics
         st.caption(
             f"Rows after page filters: **{before}** · "
             f"after Subject filter: **{after_subj}** · "
@@ -355,21 +361,22 @@ def main():
             f"after Year Level filter: **{after_year}**"
         )
 
+        g["grade"] = pd.to_numeric(g.get("grade"), errors="coerce")
         g = g.dropna(subset=["grade"])
         if g.empty:
             st.info("No graded rows match the chosen filters. Try removing one of the local filters.")
         else:
-            # Derive a simple GPA (0–4) from the numeric grade for the tracker visuals
-            g["gpa"] = (pd.to_numeric(g["grade"], errors="coerce") / 100.0 * 4.0).clip(0, 4).round(2)
+            # Derive GPA 0–4 from numeric grade
+            g["gpa"] = (g["grade"] / 100.0 * 4.0).clip(0, 4).round(2)
 
-            # Choose columns (prefer selected terms; else last 3 chronologically)
-            terms_from_page = sel_terms if "sel_terms" in locals() else None
+            # Prefer page-selected terms if available; else all (latest 3)
+            terms_from_page = sel_terms if "sel_terms" in globals() or "sel_terms" in locals() else None
             terms_order = terms_from_page if terms_from_page else \
                 sorted(g["term_label"].dropna().unique().tolist(), key=_term_sort_key)
             if len(terms_order) > 3:
                 terms_order = terms_order[-3:]
 
-            # Wide table: rows = students; columns = selected terms; values = mean GPA per term
+            # Wide table: rows = students; columns = terms; values = mean GPA
             pivot = (
                 g[g["term_label"].isin(terms_order)]
                 .groupby(["student_no", "student_name", "term_label"], observed=False)["gpa"]
@@ -379,19 +386,18 @@ def main():
                 .reindex(columns=terms_order)
             )
 
-            # If pivot is empty (e.g., grades exist but not in the last 3 terms), relax to all terms
+            # If empty (e.g., no grades in those terms), fall back to all terms
             if pivot.empty:
                 all_terms_sorted = sorted(g["term_label"].dropna().unique().tolist(), key=_term_sort_key)
                 pivot = (
                     g.groupby(["student_no", "student_name", "term_label"], observed=False)["gpa"]
-                    .mean()
-                    .reset_index()
+                    .mean().reset_index()
                     .pivot_table(index=["student_no", "student_name"], columns="term_label", values="gpa", aggfunc="mean")
                     .reindex(columns=all_terms_sorted)
                 )
                 terms_order = all_terms_sorted
 
-            # Trend descriptor ↑ ↓ →
+            # Trend descriptor
             def trend_text(row):
                 vals = [v for v in row.tolist() if pd.notnull(v)]
                 if len(vals) < 2:
@@ -418,7 +424,7 @@ def main():
 
             st.markdown("**Followed by: line graph / scatter chart.**")
 
-            # Long form → multi-series line (one series per student)
+            # Multi-series line (one series per student)
             long_df = (
                 pivot.reset_index()
                     .melt(id_vars=["student_no", "student_name"], value_vars=terms_order,
@@ -437,23 +443,112 @@ def main():
 
 
     # ─────────────────────────────────────
-    # 3) Subject Difficulty Heatmap (Fail %)
+    # 3. Subject Difficulty Heatmap
     # ─────────────────────────────────────
-    st.subheader("3) Subject Difficulty Heatmap (Fail %)")
-    if graded.empty:
-        st.info("No data for fail rates.")
+    st.subheader("3. Subject Difficulty Heatmap")
+    st.markdown(
+        "- Visualizes subjects with high failure or dropouts\n"
+        "- Subjects handled by the faculty"
+    )
+
+    # Default passing threshold if not defined elsewhere
+    try:
+        PASSING_GRADE  # noqa: F823
+    except NameError:
+        PASSING_GRADE = 75
+
+    # Base: use page-scope (already filtered by teacher/term/section)
+    try:
+        base = df_scope.copy()
+    except NameError:
+        base = df.copy()
+
+    if base.empty:
+        st.info("No enrollments available in the current page filters.")
     else:
-        tmp = graded.copy()
-        tmp["is_fail"] = tmp["grade"] < 75
-        fail = (
-            tmp.groupby("subject_code", as_index=False)
-            .agg(total=("grade", "size"), fails=("is_fail", "sum"))
-        )
-        fail["fail_rate_%"] = (fail["fails"] / fail["total"] * 100).round(2)
-        if fail.empty:
-            st.info("No subjects to display.")
+        # Normalize columns defensively
+        if "subject_code" in base.columns:
+            base["subject_code"] = base["subject_code"].astype(str).str.strip().str.upper()
         else:
-            st.dataframe(fail.sort_values("fail_rate_%", ascending=False), use_container_width=True)
+            st.info("No subject codes found in the current data.")
+            st.stop()
+
+        if "subject_title" in base.columns:
+            base["subject_title"] = base["subject_title"].astype(str).str.strip()
+        else:
+            base["subject_title"] = ""  # keep pipeline working
+
+        # Grades
+        grades = pd.to_numeric(base["grade"], errors="coerce") if "grade" in base.columns else pd.Series(dtype=float)
+        is_graded = grades.notna()
+        is_failed = is_graded & (grades < PASSING_GRADE)
+
+        # Dropout heuristic
+        if "remark" in base.columns:
+            remarks = base["remark"].astype(str).str.lower().fillna("")
+            dropped_by_remark = remarks.str.contains("drop") | remarks.str.contains("withdr")
+        else:
+            dropped_by_remark = pd.Series(False, index=base.index)
+
+        # Ungraded counts as potential dropout; refine to your policy if needed
+        is_dropout = (~is_graded) | dropped_by_remark
+
+        work = base.assign(
+            _graded=is_graded,
+            _failed=is_failed,
+            _drop=is_dropout,
+        )
+
+        # Aggregate per subject
+        grp = (
+            work.groupby(["subject_code", "subject_title"], dropna=False)
+                .agg(
+                    total=("subject_code", "size"),
+                    graded_cnt=("_graded", "sum"),
+                    failed_cnt=("_failed", "sum"),
+                    dropout_cnt=("_drop", "sum"),
+                )
+                .reset_index()
+        )
+
+        # Rates (%)
+        grp["Fail Rate (%)"] = np.where(
+            grp["graded_cnt"] > 0,
+            (grp["failed_cnt"] / grp["graded_cnt"] * 100).round(0),
+            0,
+        ).astype(int)
+
+        grp["Dropout Rate (%)"] = np.where(
+            grp["total"] > 0,
+            (grp["dropout_cnt"] / grp["total"] * 100).round(0),
+            0,
+        ).astype(int)
+
+        # Difficulty rule (tweak thresholds as needed)
+        def _difficulty(row):
+            fail = row["Fail Rate (%)"]
+            drp = row["Dropout Rate (%)"]
+            if fail >= 15 or drp >= 5:
+                return "High"
+            if fail >= 8 or drp >= 3:
+                return "Medium"
+            return "Low"
+
+        grp["Difficulty Level"] = grp.apply(_difficulty, axis=1)
+
+        # Final display
+        show = grp.rename(columns={
+            "subject_code": "Course Code",
+            "subject_title": "Course Name",
+        })[["Course Code", "Course Name", "Fail Rate (%)", "Dropout Rate (%)", "Difficulty Level"]]
+
+        # Sort: High → Medium → Low, then Fail Rate desc
+        lvl_order = pd.CategoricalDtype(categories=["High", "Medium", "Low"], ordered=True)
+        show["Difficulty Level"] = show["Difficulty Level"].astype(lvl_order)
+        show = show.sort_values(["Difficulty Level", "Fail Rate (%)"], ascending=[True, False]).reset_index(drop=True)
+
+        st.dataframe(show, use_container_width=True)
+
 
     # ─────────────────────────────────────
     # 4) Intervention Candidates (latest term)
