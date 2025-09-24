@@ -551,58 +551,164 @@ def main():
 
 
     # ─────────────────────────────────────
-    # 4) Intervention Candidates (latest term)
+    # 4. Intervention Candidates List
     # ─────────────────────────────────────
-    st.subheader("4) Intervention Candidates")
-    if graded.empty:
-        st.info("No graded entries.")
+    st.subheader("4. Intervention Candidates List")
+    st.markdown(
+        "- Lists students at academic risk based on current semester data (e.g. low grades, missing grades)"
+    )
+
+    # Default passing threshold if not defined globally
+    try:
+        PASSING_GRADE
+    except NameError:
+        PASSING_GRADE = 75
+
+    # Use page-scope dataset (already filtered by teacher / term / section)
+    try:
+        base4 = df_scope.copy()
+    except NameError:
+        base4 = df.copy()
+
+    if base4.empty:
+        st.info("No enrollments available in the current page filters.")
     else:
-        latest_term = None
-        if not graded["term_label"].isna().all():
-            uniq = graded["term_label"].dropna().unique().tolist()
-            if uniq:
-                latest_term = sorted(uniq, key=_term_sort_key)[-1]
-        cur = graded if not latest_term else graded[graded["term_label"] == latest_term]
-        risk = cur[cur["grade"] < 75].copy().sort_values(["student_name", "grade"])
-        if risk.empty:
-            st.success("No at-risk students in the latest term.")
+        # Normalize fields
+        if "subject_code" in base4.columns:
+            base4["subject_code"] = base4["subject_code"].astype(str).str.strip().str.upper()
+        if "subject_title" in base4.columns:
+            base4["subject_title"] = base4["subject_title"].astype(str).str.strip()
+
+        # Determine the current term scope
+        try:
+            terms_selected = sel_terms if sel_terms else None
+        except NameError:
+            terms_selected = None
+
+        if terms_selected:
+            current_scope = base4[base4["term_label"].isin(terms_selected)].copy()
         else:
-            show = risk[["student_no", "student_name", "subject_code", "grade", "term_label"]].rename(
-                columns={
-                    "student_no": "Student No",
-                    "student_name": "Student",
-                    "subject_code": "Subject",
-                    "grade": "Grade",
-                    "term_label": "Term",
-                }
-            )
-            st.dataframe(show, use_container_width=True, height=min(520, 35 + 28 * len(show)))
+            if base4["term_label"].dropna().empty:
+                current_scope = base4.copy()
+            else:
+                latest_term = sorted(base4["term_label"].dropna().unique().tolist(), key=_term_sort_key)[-1]
+                current_scope = base4[base4["term_label"] == latest_term].copy()
+
+        if current_scope.empty:
+            st.info("No enrollments found for the selected/most recent term.")
+        else:
+            # Grade + remark processing
+            grades = pd.to_numeric(current_scope.get("grade"), errors="coerce")
+            remarks = current_scope.get("remark")
+            if remarks is None:
+                remarks = pd.Series([""] * len(current_scope), index=current_scope.index)
+            remarks = remarks.astype(str).str.lower()
+
+            # Missing grade = INC in remarks or NaN grade
+            missing_mask = grades.isna() | remarks.str.contains(r"\binc|\bincomplete")
+
+            # Failed = below passing grade (numeric)
+            failed_mask = grades.notna() & (grades < PASSING_GRADE)
+
+            risk_rows = current_scope[missing_mask | failed_mask].copy()
+            if risk_rows.empty:
+                st.success("No intervention candidates in the current term scope.")
+            else:
+                def risk_flag(row):
+                    g = pd.to_numeric(row.get("grade"), errors="coerce")
+                    r = str(row.get("remark") or "").lower()
+                    if pd.isna(g) or ("inc" in r or "incomplete" in r):
+                        return "Missing Grade"
+                    if g < PASSING_GRADE:
+                        return f"At Risk (<{PASSING_GRADE})"
+                    return "—"
+
+                risk_rows["Risk Flag"] = risk_rows.apply(risk_flag, axis=1)
+
+                # Display table
+                show = risk_rows.rename(columns={
+                    "student_no": "Student ID",
+                    "student_name": "Name",
+                    "subject_code": "Course Code",
+                    "subject_title": "Course Name",
+                    "grade": "Current Grade",
+                })[
+                    ["Student ID", "Name", "Course Code", "Course Name", "Current Grade", "Risk Flag"]
+                ].sort_values(["Risk Flag", "Name", "Course Code"]).reset_index(drop=True)
+
+                # Faculty name line
+                fac_name = ""
+                if "teacher_name" in current_scope.columns and current_scope["teacher_name"].notna().any():
+                    fac_name = current_scope["teacher_name"].dropna().iloc[0]
+                elif "teacher_email" in current_scope.columns and current_scope["teacher_email"].notna().any():
+                    fac_name = current_scope["teacher_email"].dropna().iloc[0]
+
+                st.markdown(f"**Faculty Name:** {fac_name if fac_name else '—'}")
+                st.dataframe(show, use_container_width=True)
 
     # ─────────────────────────────────────
-    # 5) Grade Submission Status
+    # 5. Grade Submission Status
     # ─────────────────────────────────────
-    st.subheader("5) Grade Submission Status")
-    if df.empty:
-        st.info("No enrollments to summarize.")
+    st.subheader("5. Grade Submission Status")
+    st.markdown(
+        "- Tracks the status of grade submissions by faculty for each class. (e.g., complete grades, with blank grades)"
+    )
+
+    # Use page-scope dataset (already filtered by teacher / term / section)
+    try:
+        base5 = df_scope.copy()
+    except NameError:
+        base5 = df.copy()
+
+    if base5.empty:
+        st.info("No enrollments available in the current page filters.")
     else:
+        # Normalize fields we rely on
+        base5["subject_code"] = base5.get("subject_code", "").astype(str).str.strip().str.upper()
+        base5["subject_title"] = base5.get("subject_title", "").astype(str).str.strip()
+
+        # Faculty line
+        fac_name = ""
+        if "teacher_name" in base5.columns and base5["teacher_name"].notna().any():
+            fac_name = base5["teacher_name"].dropna().iloc[0]
+        elif "teacher_email" in base5.columns and base5["teacher_email"].notna().any():
+            fac_name = base5["teacher_email"].dropna().iloc[0]
+        st.markdown(f"**Grade Submission Status — {fac_name if fac_name else '—'}**")
+
+        # Per-subject submission stats
+        grades = pd.to_numeric(base5.get("grade"), errors="coerce")
+        base5 = base5.assign(_submitted=grades.notna())
+
         status = (
-            df.groupby("subject_code")
-            .agg(
-                total=("grade", "size"),
-                graded=("grade", lambda s: s.notna().sum()),
-            )
-            .reset_index()
+            base5.groupby(["subject_code", "subject_title"], dropna=False)
+                .agg(
+                    Submitted_Grades=("_submitted", "sum"),
+                    Total_Students=("subject_code", "size"),
+                )
+                .reset_index()
         )
-        status["completion_%"] = (status["graded"] / status["total"] * 100).round(1)
-        status = status.sort_values(["completion_%", "subject_code"], ascending=[True, True]).rename(
-            columns={
-                "subject_code": "Subject",
-                "total": "Total Enrollments",
-                "graded": "Graded Count",
-                "completion_%": "Completion %",
-            }
+        status["Submission Rate"] = np.where(
+            status["Total_Students"] > 0,
+            (status["Submitted_Grades"] / status["Total_Students"] * 100).round(0).astype(int),
+            0
         )
-        st.dataframe(status, use_container_width=True)
+
+        show = status.rename(columns={
+            "subject_code": "Course Code",
+            "subject_title": "Course Title",
+            "Submitted_Grades": "Submitted Grades",
+            "Total_Students": "Total Students",
+        })[["Course Code", "Course Title", "Submitted Grades", "Total Students", "Submission Rate"]]
+
+        # Sort by lowest submission rate first (to highlight gaps)
+        show = show.sort_values(["Submission Rate", "Course Code"]).reset_index(drop=True)
+
+        # Render (add % sign for readability)
+        show_display = show.copy()
+        show_display["Submission Rate"] = show_display["Submission Rate"].astype(int).astype(str) + "%"
+
+        st.dataframe(show_display, use_container_width=True)
+
 
     # ─────────────────────────────────────
     # 6) Custom Query Builder
