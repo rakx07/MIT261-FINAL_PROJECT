@@ -1,10 +1,23 @@
 import os
 from pymongo import MongoClient
 from dotenv import load_dotenv
+import streamlit as st
 
+# Load local .env if it exists
 load_dotenv()
-MONGODB_URI = os.getenv("MONGODB_URI")  # e.g. mongodb+srv://user:pass@cluster0.x.mongodb.net
-DB_NAME = os.getenv("DB_NAME", "mit261")
+
+# Try Streamlit secrets first (on cloud), fallback to .env (local)
+MONGODB_URI = (
+    st.secrets["MONGODB_URI"]
+    if "MONGODB_URI" in st.secrets
+    else os.getenv("MONGODB_URI")
+)
+
+DB_NAME = (
+    st.secrets["DB_NAME"]
+    if "DB_NAME" in st.secrets
+    else os.getenv("DB_NAME", "mit261")
+)
 
 _client = None
 _db = None
